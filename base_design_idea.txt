@@ -1,0 +1,19 @@
+Core idea
+Want to create an bug bot agent using claude agent sdk and fastapi (anyother api framework)
+* Which can get webhooks from slack (from bug reports channel)
+* Once it got the webhook, reply back that is got the report and will investigate further and inform that it will tag L1 / devs if required
+* Then it should call the claude agent sdk, to debug the issue with the details the reporter provided
+    * The claude agent, will have skills to solve or debug frequent issues or bugs
+    * claude agent should use grafana and newrelic mcp to gather further information regarding the issue
+    * Should query github to find the relevant repo and clone it for further use
+    * Should be able to query databases to find relevant data
+    * Should be able to provide a code or data fix
+    * If code fix is needed, create a PR in the relevant repos
+    * If it is not a simple fix or you cannot conclude the issue, tag relevant devs (frequently) and l1
+* If fix is made or need human help, should create a thread in another channel with debugging details and pr link if any, with the original bug report thread link
+* It should peridically ask for updates from devs or l1 if the bug is open without any resolution after a sla
+
+Provide a high level technical document, on how this can be implemented and tech stack, frameworks and packages required
+Deployment strategy for claude agent sdk, how it will clone repos and query github etc.
+and check whehther temporal can be used for any of the use case.
+While creating a plan, if you are facing any doubts ask the user instead of assuming.

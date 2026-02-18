@@ -1,0 +1,22 @@
+ To run locally
+
+  # Terminal 1: Start infrastructure
+  docker compose up -d
+
+  # Terminal 2: Install + run migrations
+  pip install -e ".[dev]"
+  alembic upgrade head
+
+  # Terminal 3: Start FastAPI
+  uvicorn bug_bot.main:app --reload --port 8000
+
+  # Terminal 4: Start Temporal Worker
+  python -m bug_bot.worker
+
+  # Terminal 5: Expose to Slack
+  ngrok http 8000
+
+
+claude --resume 1a362cb3-a889-4a54-9c29-f0124406d6ef
+
+psql --host=localhost --port=5433 --username=bugbot --dbname=bugbot

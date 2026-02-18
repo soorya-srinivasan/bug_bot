@@ -1,0 +1,37 @@
+services:
+  postgresql:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: bugbot
+      POSTGRES_PASSWORD: bugbot
+      POSTGRES_DB: bugbot
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=bugbot
+      - POSTGRES_PWD=bugbot
+      - POSTGRES_SEEDS=postgresql
+    depends_on:
+      - postgresql
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    depends_on:
+      - temporal
+
+volumes:
+  pgdata:
