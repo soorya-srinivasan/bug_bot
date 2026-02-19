@@ -161,7 +161,7 @@ async def dev_reply(bug_id: str, payload: DevReplyRequest):
     temporal = await get_temporal_client()
     handle = temporal.get_workflow_handle(workflow_id)
     try:
-        await handle.signal(BugInvestigationWorkflow.dev_reply, payload.message, intent)
+        await handle.signal(BugInvestigationWorkflow.dev_reply, args=[payload.message, intent])
     except Exception as e:
         return {"status": "error", "bug_id": bug_id, "error": str(e)}
     return {"status": "signaled", "bug_id": bug_id, "intent": intent, "workflow_id": workflow_id}

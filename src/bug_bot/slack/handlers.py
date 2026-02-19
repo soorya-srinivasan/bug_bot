@@ -138,39 +138,48 @@ def register_handlers(app: AsyncApp):
         )
 
 
+_STATUS_REPLIES = {
+    "new": ":hourglass: Your report is queued for triage, hang tight!",
+    "triaged": ":mag: Investigation is starting soon...",
+    "investigating": ":robot_face: I'm currently investigating this bug. Check <#{channel}> for updates once done.",
+    "awaiting_dev": ":speech_balloon: Waiting for a developer decision in <#{channel}>.",
+    "escalated": ":rotating_light: This bug has been escalated. A developer is looking at it.",
+    "resolved": ":white_check_mark: This bug has already been resolved.",
+}
+
+
 async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
-    """Handle a human reply in a #bug-reports thread — signal the workflow."""
+    """Handle a human reply in #bug-reports — respond with current bug status."""
     channel_id = event["channel"]
     thread_ts = event["thread_ts"]
-    user = event.get("user", "unknown")
     text = event.get("text", "")
+
+    # Ignore bot messages and commands handled elsewhere
+    if not text or text.startswith("!"):
+        return
 
     async with async_session() as session:
         repo = BugRepository(session)
         bug = await repo.get_bug_by_thread_ts(channel_id, thread_ts)
-        if not bug or not bug.temporal_workflow_id:
+        if not bug:
             return
 
-    intent = _detect_intent(text)
-    try:
-        temporal = await get_temporal_client()
-        handle = temporal.get_workflow_handle(bug.temporal_workflow_id)
-        await handle.signal(BugInvestigationWorkflow.dev_reply, text, intent)
-        ack = (
-            ":robot_face: Got it! Creating a PR now..."
-            if intent == "approve"
-            else ":mag: Running a follow-up investigation with your additional context..."
-        )
-        await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=ack)
-    except Exception:
-        logger.exception("Failed to signal workflow for %s", bug.bug_id)
+    summary_channel = settings.bug_summaries_channel_id or "bug-summaries"
+    reply = _STATUS_REPLIES.get(
+        bug.status,
+        f":information_source: Bug `{bug.bug_id}` is in status `{bug.status}`.",
+    ).replace("{channel}", summary_channel)
+
+    await client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=reply)
 
 
 async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
-    """Handle a reply in #bug-summaries — signal the workflow and relay to original thread."""
+    """Handle a reply in #bug-summaries — signal the workflow with dev decision."""
     thread_ts = event["thread_ts"]
-    user = event.get("user", "unknown")
     text = event.get("text", "")
+
+    if not text:
+        return
 
     async with async_session() as session:
         repo = BugRepository(session)
@@ -182,14 +191,15 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
     try:
         temporal = await get_temporal_client()
         handle = temporal.get_workflow_handle(bug.temporal_workflow_id)
-        await handle.signal(BugInvestigationWorkflow.dev_reply, text, intent)
+        await handle.signal(BugInvestigationWorkflow.dev_reply, args=[text, intent])
         ack = (
             ":robot_face: Got it! Creating a PR now..."
             if intent == "approve"
             else ":mag: Running a follow-up investigation with your additional context..."
         )
+        # Ack in #bug-summaries thread
         await client.chat_postMessage(
-            channel=bug.slack_channel_id, thread_ts=bug.slack_thread_ts, text=ack
+            channel=event["channel"], thread_ts=thread_ts, text=ack
         )
     except Exception:
         logger.exception("Failed to signal workflow for %s", bug.bug_id)

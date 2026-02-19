@@ -58,28 +58,28 @@ async def post_slack_message(input: PostMessageInput) -> None:
 
 @activity.defn
 async def post_investigation_results(input: PostResultsInput) -> None:
-    """Post formatted investigation results to Slack thread."""
+    """Post a brief acknowledgment in the original bug thread; full results go to #bug-summaries."""
+    fix_type = input.result.get("fix_type", "unknown")
+    summary_channel = settings.bug_summaries_channel_id or "#bug-summaries"
+    text = (
+        f":white_check_mark: Investigation complete for `{input.bug_id}`. "
+        f"Fix type: `{fix_type}`. "
+        f"Full details posted in <#{summary_channel}>."
+    )
     if not _slack_configured():
-        activity.logger.info(
-            f"[Slack skip] Investigation results for {input.bug_id}: "
-            f"fix_type={input.result.get('fix_type')}, "
-            f"confidence={input.result.get('confidence')}, "
-            f"summary={input.result.get('summary')}"
-        )
+        activity.logger.info(f"[Slack skip] {text}")
         return
     client = _get_slack_client()
-    blocks = format_investigation_result(input.result, input.bug_id)
     await client.chat_postMessage(
         channel=input.channel_id,
         thread_ts=input.thread_ts,
-        blocks=blocks,
-        text=f"Investigation complete for {input.bug_id}",  # fallback
+        text=text,
     )
 
 
 @activity.defn
 async def create_summary_thread(input: PostResultsInput) -> str:
-    """Create a summary post in #bug-summaries channel. Returns the message ts."""
+    """Post full investigation results to #bug-summaries. Returns the message ts."""
     if not _slack_configured():
         activity.logger.info(
             f"[Slack skip] Summary for {input.bug_id} (severity={input.severity}): "
@@ -87,17 +87,21 @@ async def create_summary_thread(input: PostResultsInput) -> str:
         )
         return ""
     client = _get_slack_client()
-    blocks = format_summary_message(
+    # Header block linking back to original thread
+    header_blocks = format_summary_message(
         bug_id=input.bug_id,
         severity=input.severity,
         result=input.result,
         original_channel=input.channel_id,
         original_thread_ts=input.thread_ts,
     )
+    # Full investigation detail blocks
+    detail_blocks = format_investigation_result(input.result, input.bug_id)
+    blocks = header_blocks + [{"type": "divider"}] + detail_blocks
     response = await client.chat_postMessage(
         channel=settings.bug_summaries_channel_id,
         blocks=blocks,
-        text=f"Bug summary: {input.bug_id}",  # fallback
+        text=f"Bug investigation results: {input.bug_id}",
     )
     return response.get("ts", "")
 
