@@ -6,15 +6,6 @@ from pydantic import BaseModel, Field, NonNegativeInt
 
 Severity = Literal["P1", "P2", "P3", "P4"]
 Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved"]
-Category = Literal[
-    "api_error",
-    "ui_bug",
-    "data_issue",
-    "performance",
-    "security",
-    "infrastructure",
-    "unknown",
-]
 
 
 class PaginationParams(BaseModel):
@@ -25,7 +16,6 @@ class PaginationParams(BaseModel):
 class BugFilters(PaginationParams):
     status: Status | None = None
     severity: Severity | None = None
-    category: Category | None = None
     service: str | None = None
     from_date: datetime | None = None
     to_date: datetime | None = None
@@ -46,7 +36,6 @@ class BugListItem(BaseModel):
     original_message: str
     severity: Severity
     status: Status
-    category: Category | None = None
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
@@ -63,7 +52,6 @@ class PaginatedBugs(BaseModel):
 class BugUpdate(BaseModel):
     severity: Severity | None = None
     status: Status | None = None
-    category: Category | None = None
 
 
 class InvestigationResponse(BaseModel):

@@ -52,7 +52,6 @@ class BugRepository:
         *,
         status: str | None = None,
         severity: str | None = None,
-        category: str | None = None,
         service: str | None = None,
         from_date: datetime | None = None,
         to_date: datetime | None = None,
@@ -68,8 +67,6 @@ class BugRepository:
             stmt = stmt.where(BugReport.status == status)
         if severity:
             stmt = stmt.where(BugReport.severity == severity)
-        if category:
-            stmt = stmt.where(BugReport.category == category)
         if from_date:
             stmt = stmt.where(BugReport.created_at >= from_date)
         if to_date:
@@ -116,7 +113,6 @@ class BugRepository:
         *,
         severity: str | None = None,
         status: str | None = None,
-        category: str | None = None,
     ) -> BugReport | None:
         values: dict = {"updated_at": datetime.utcnow()}
         if severity is not None:
@@ -125,8 +121,6 @@ class BugRepository:
             values["status"] = status
             if status == "resolved":
                 values["resolved_at"] = datetime.utcnow()
-        if category is not None:
-            values["category"] = category
 
         if len(values) == 1:  # only updated_at
             return await self.get_bug_by_id(bug_id)

@@ -55,7 +55,6 @@ async def list_bugs(
     repo: BugRepository = Depends(get_repo),
     status: str | None = Query(default=None),
     severity: str | None = Query(default=None),
-    category: str | None = Query(default=None),
     service: str | None = Query(default=None),
     from_date: datetime | None = Query(default=None),
     to_date: datetime | None = Query(default=None),
@@ -66,7 +65,6 @@ async def list_bugs(
     rows, total = await repo.list_bugs(
         status=status,
         severity=severity,
-        category=category,
         service=service,
         from_date=from_date,
         to_date=to_date,
@@ -93,7 +91,6 @@ async def list_bugs(
                 original_message=bug.original_message,
                 severity=bug.severity,
                 status=bug.status,
-                category=bug.category,
                 created_at=bug.created_at,
                 updated_at=bug.updated_at,
                 resolved_at=bug.resolved_at,
@@ -125,7 +122,6 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         original_message=bug.original_message,
         severity=bug.severity,
         status=bug.status,
-        category=bug.category,
         created_at=bug.created_at,
         updated_at=bug.updated_at,
         resolved_at=bug.resolved_at,
@@ -147,7 +143,6 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         bug_id,
         severity=payload.severity,
         status=new_status if payload.status is not None else None,
-        category=payload.category,
     )
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
@@ -168,7 +163,6 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         original_message=updated.original_message,
         severity=updated.severity,
         status=updated.status,
-        category=updated.category,
         created_at=updated.created_at,
         updated_at=updated.updated_at,
         resolved_at=updated.resolved_at,
