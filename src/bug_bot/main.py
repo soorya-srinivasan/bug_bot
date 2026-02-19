@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from pydantic import BaseModel
 
 from bug_bot.config import settings
+from bug_bot.api import admin as admin_api
 from bug_bot.db.session import async_session
 from bug_bot.db.repository import BugRepository
 from bug_bot.temporal.client import get_temporal_client
@@ -47,6 +48,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Bug Bot", lifespan=lifespan)
+app.include_router(admin_api.router, prefix="/api/admin", tags=["admin"])
 
 
 @app.get("/health")

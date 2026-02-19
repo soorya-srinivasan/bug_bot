@@ -22,6 +22,7 @@ class BugReport(Base):
     original_message: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(String(5), nullable=False, default="P3")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
+    category: Mapped[str | None] = mapped_column(String(50))
     temporal_workflow_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -36,6 +37,7 @@ class BugReport(Base):
         Index("idx_bug_reports_status", "status"),
         Index("idx_bug_reports_severity", "severity"),
         Index("idx_bug_reports_slack_thread_ts", "slack_thread_ts"),
+        Index("idx_bug_reports_category", "category"),
     )
 
 
