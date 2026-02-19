@@ -41,21 +41,16 @@ class BugInvestigationWorkflow:
     async def run(self, input: BugReportInput) -> dict:
         workflow.logger.info(f"Starting investigation for {input.bug_id}")
 
-        # Step 1: Parse and classify the bug report
         parsed: ParsedBug = await workflow.execute_activity(
-            parse_bug_report,
-            input,
+            parse_bug_report, input,
             start_to_close_timeout=timedelta(seconds=30),
         )
 
-        # Step 2: Update DB status to investigating
         await workflow.execute_activity(
-            update_bug_status,
-            args=[input.bug_id, "investigating"],
+            update_bug_status, args=[input.bug_id, "investigating"],
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        # Step 3: Run Claude Agent investigation (long-running)
         investigation_dict: dict = await workflow.execute_activity(
             run_agent_investigation,
             args=[input.bug_id, input.message_text, parsed.severity, parsed.relevant_services],
@@ -68,151 +63,149 @@ class BugInvestigationWorkflow:
             ),
         )
 
-        # Step 4: Save investigation to DB
         await workflow.execute_activity(
-            save_investigation_result,
-            args=[input.bug_id, investigation_dict],
+            save_investigation_result, args=[input.bug_id, investigation_dict],
             start_to_close_timeout=timedelta(seconds=10),
         )
 
-        # Step 5: Post results to Slack thread
         results_input = PostResultsInput(
-            channel_id=input.channel_id,
-            thread_ts=input.thread_ts,
-            bug_id=input.bug_id,
-            severity=parsed.severity,
-            result=investigation_dict,
+            channel_id=input.channel_id, thread_ts=input.thread_ts,
+            bug_id=input.bug_id, severity=parsed.severity, result=investigation_dict,
         )
 
         await workflow.execute_activity(
-            post_investigation_results,
-            results_input,
+            post_investigation_results, results_input,
             start_to_close_timeout=timedelta(seconds=15),
         )
 
-        # Step 6: Create summary in #bug-summaries and store thread_ts
         summary_thread_ts: str = await workflow.execute_activity(
-            create_summary_thread,
-            results_input,
+            create_summary_thread, results_input,
             start_to_close_timeout=timedelta(seconds=15),
         )
-
         if summary_thread_ts:
             await workflow.execute_activity(
-                store_summary_thread_ts,
-                args=[input.bug_id, summary_thread_ts],
+                store_summary_thread_ts, args=[input.bug_id, summary_thread_ts],
                 start_to_close_timeout=timedelta(seconds=10),
             )
 
-        # Step 7: If unresolved, escalate and start SLA tracking
         fix_type = investigation_dict.get("fix_type", "unknown")
         if fix_type in ("needs_human", "unknown"):
             await workflow.execute_activity(
                 escalate_to_humans,
                 EscalationInput(
-                    channel_id=input.channel_id,
-                    thread_ts=input.thread_ts,
-                    bug_id=input.bug_id,
-                    severity=parsed.severity,
+                    channel_id=input.channel_id, thread_ts=input.thread_ts,
+                    bug_id=input.bug_id, severity=parsed.severity,
                     relevant_services=investigation_dict.get("relevant_services", []),
                 ),
                 start_to_close_timeout=timedelta(seconds=15),
             )
-
-            # Start child SLA tracking workflow
             await workflow.start_child_workflow(
                 SLATrackingWorkflow.run,
                 SLATrackingInput(
-                    bug_id=input.bug_id,
-                    severity=parsed.severity,
-                    channel_id=input.channel_id,
-                    thread_ts=input.thread_ts,
+                    bug_id=input.bug_id, severity=parsed.severity,
+                    channel_id=input.channel_id, thread_ts=input.thread_ts,
                     assigned_users=investigation_dict.get("recommended_actions", []),
                 ),
                 id=f"sla-{input.bug_id}",
             )
-
             await workflow.execute_activity(
-                update_bug_status,
-                args=[input.bug_id, "escalated"],
+                update_bug_status, args=[input.bug_id, "escalated"],
                 start_to_close_timeout=timedelta(seconds=10),
             )
         else:
+            # ✅ Don't resolve yet — wait for dev confirmation
             await workflow.execute_activity(
-                update_bug_status,
-                args=[input.bug_id, "resolved"],
+                update_bug_status, args=[input.bug_id, "pending_verification"],
                 start_to_close_timeout=timedelta(seconds=10),
             )
 
-        # Step 8: Wait for developer reply (up to 48 hours)
+        # ✅ Loop to support multiple dev replies
         claude_session_id = investigation_dict.get("claude_session_id")
+        current_result = investigation_dict
 
-        condition_met = await workflow.wait_condition(
-            lambda: self._dev_reply is not None,
-            timeout=timedelta(hours=48),
-        )
+        while True:
+            condition_met = await workflow.wait_condition(
+                lambda: self._dev_reply is not None,
+                timeout=timedelta(hours=48),
+            )
 
-        if not condition_met:
-            workflow.logger.info(f"No developer reply received for {input.bug_id} within 48 hours")
-            return investigation_dict
+            if not condition_met:
+                workflow.logger.info(f"No reply received for {input.bug_id}, closing workflow")
+                # If still pending verification with no reply, mark resolved
+                await workflow.execute_activity(
+                    update_bug_status, args=[input.bug_id, "resolved"],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                break
 
-        # Developer replied — run follow-up investigation
-        dev_reply_data = self._dev_reply
-        self._dev_reply = None  # Reset for potential further replies
+            dev_reply_data = self._dev_reply
+            self._dev_reply = None  # Reset for next iteration
+            reply_type = dev_reply_data["reply_type"]
 
-        workflow.logger.info(
-            f"Developer replied to {input.bug_id} with reply_type={dev_reply_data['reply_type']}"
-        )
+            workflow.logger.info(f"Dev replied to {input.bug_id}: reply_type={reply_type}")
 
-        # Notify in original thread that follow-up is starting
-        await workflow.execute_activity(
-            post_slack_message,
-            PostMessageInput(
-                channel_id=input.channel_id,
-                thread_ts=input.thread_ts,
-                text=f":mag: Follow-up investigation started for {input.bug_id} based on developer feedback...",
-            ),
-            start_to_close_timeout=timedelta(seconds=15),
-        )
+            # ✅ Dev explicitly confirmed fix — mark resolved and stop
+            if reply_type == "resolved":
+                await workflow.execute_activity(
+                    update_bug_status, args=[input.bug_id, "resolved"],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                await workflow.execute_activity(
+                    post_slack_message,
+                    PostMessageInput(
+                        channel_id=input.channel_id, thread_ts=input.thread_ts,
+                        text=f":white_check_mark: {input.bug_id} marked as resolved by developer.",
+                    ),
+                    start_to_close_timeout=timedelta(seconds=15),
+                )
+                break
 
-        # Run follow-up investigation — resumes original Claude session
-        followup_result: dict = await workflow.execute_activity(
-            run_followup_investigation,
-            args=[
-                input.bug_id,
-                dev_reply_data["message"],
-                dev_reply_data["reply_type"],
-                claude_session_id,
-            ],
-            start_to_close_timeout=timedelta(minutes=15),
-            heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=RetryPolicy(
-                maximum_attempts=2,
-                initial_interval=timedelta(seconds=10),
-                backoff_coefficient=2.0,
-            ),
-        )
+            # Otherwise run a follow-up investigation
+            await workflow.execute_activity(
+                post_slack_message,
+                PostMessageInput(
+                    channel_id=input.channel_id, thread_ts=input.thread_ts,
+                    text=f":mag: Follow-up investigation started for {input.bug_id}...",
+                ),
+                start_to_close_timeout=timedelta(seconds=15),
+            )
 
-        # Save follow-up results
-        await workflow.execute_activity(
-            save_investigation_result,
-            args=[input.bug_id, followup_result],
-            start_to_close_timeout=timedelta(seconds=10),
-        )
+            followup_result: dict = await workflow.execute_activity(
+                run_followup_investigation,
+                args=[input.bug_id, dev_reply_data["message"], reply_type, claude_session_id],
+                start_to_close_timeout=timedelta(minutes=15),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(
+                    maximum_attempts=2,
+                    initial_interval=timedelta(seconds=10),
+                    backoff_coefficient=2.0,
+                ),
+            )
 
-        # Post follow-up results to Slack
-        followup_results_input = PostResultsInput(
-            channel_id=input.channel_id,
-            thread_ts=input.thread_ts,
-            bug_id=input.bug_id,
-            severity=parsed.severity,
-            result=followup_result,
-        )
+            # Update session ID in case it rotated
+            claude_session_id = followup_result.get("claude_session_id", claude_session_id)
+            current_result = followup_result
 
-        await workflow.execute_activity(
-            post_investigation_results,
-            followup_results_input,
-            start_to_close_timeout=timedelta(seconds=15),
-        )
+            await workflow.execute_activity(
+                save_investigation_result, args=[input.bug_id, followup_result],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
 
-        return followup_result
+            followup_results_input = PostResultsInput(
+                channel_id=input.channel_id, thread_ts=input.thread_ts,
+                bug_id=input.bug_id, severity=parsed.severity, result=followup_result,
+            )
+            await workflow.execute_activity(
+                post_investigation_results, followup_results_input,
+                start_to_close_timeout=timedelta(seconds=15),
+            )
+
+            # ✅ Update status after each follow-up
+            followup_fix_type = followup_result.get("fix_type", "unknown")
+            new_status = "pending_verification" if followup_fix_type not in ("needs_human", "unknown") else "escalated"
+            await workflow.execute_activity(
+                update_bug_status, args=[input.bug_id, new_status],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+
+        return current_result
