@@ -5,6 +5,8 @@ class Settings(BaseSettings):
     # Slack
     slack_bot_token: str = ""
     slack_signing_secret: str = ""
+    slack_app_token: str = ""
+    slack_socket_mode: bool = False
     bug_reports_channel_id: str = ""
     bug_summaries_channel_id: str = ""
 

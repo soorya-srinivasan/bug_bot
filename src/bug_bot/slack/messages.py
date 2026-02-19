@@ -88,3 +88,33 @@ def format_summary_message(
         blocks[0]["text"]["text"] += f"\n<{result['pr_url']}|View PR>"
 
     return blocks
+
+
+def format_triage_response(triage: dict, bug_id: str) -> str:
+    """Format the initial triage acknowledgement as mrkdwn text."""
+    severity = triage.get("severity", "P3")
+    category = triage.get("category", "unknown")
+    summary = triage.get("summary", "")
+    services = triage.get("affected_services", [])
+    services_str = ", ".join(f"`{s}`" for s in services) if services else "_unknown_"
+
+    return (
+        f":mag: *Bug Bot* received this report (`{bug_id}`).\n"
+        f"*Severity:* `{severity}` | *Category:* `{category}`\n"
+        f"*Affected services:* {services_str}\n"
+        f"*Summary:* {summary}\n"
+        f"I'm starting an investigation and will update this thread."
+    )
+
+
+def format_followup_question(question: str) -> list[dict]:
+    """Format a follow-up question from the agent as Slack blocks."""
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":speech_balloon: *Bug Bot has a question:*\n{question}",
+            },
+        },
+    ]

@@ -7,22 +7,36 @@ with workflow.unsafe.imports_passed_through():
     from bug_bot.temporal import BugReportInput, ParsedBug, InvestigationResult, SLATrackingInput
     from bug_bot.temporal.activities.parsing_activity import parse_bug_report
     from bug_bot.temporal.activities.slack_activity import (
+        post_slack_message,
         post_investigation_results,
         create_summary_thread,
         escalate_to_humans,
+        PostMessageInput,
         PostResultsInput,
         EscalationInput,
     )
     from bug_bot.temporal.activities.database_activity import (
         update_bug_status,
         save_investigation_result,
+        store_summary_thread_ts,
     )
-    from bug_bot.temporal.activities.agent_activity import run_agent_investigation
+    from bug_bot.temporal.activities.agent_activity import (
+        run_agent_investigation,
+        run_followup_investigation,
+    )
     from bug_bot.temporal.workflows.sla_tracking import SLATrackingWorkflow
 
 
 @workflow.defn
 class BugInvestigationWorkflow:
+    def __init__(self) -> None:
+        self._dev_reply: dict | None = None
+
+    @workflow.signal
+    async def dev_reply(self, message: str, reply_type: str) -> None:
+        """Signal handler for developer replies in the summary thread."""
+        self._dev_reply = {"message": message, "reply_type": reply_type}
+
     @workflow.run
     async def run(self, input: BugReportInput) -> dict:
         workflow.logger.info(f"Starting investigation for {input.bug_id}")
@@ -76,12 +90,19 @@ class BugInvestigationWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
         )
 
-        # Step 6: Create summary in #bug-summaries
-        await workflow.execute_activity(
+        # Step 6: Create summary in #bug-summaries and store thread_ts
+        summary_thread_ts: str = await workflow.execute_activity(
             create_summary_thread,
             results_input,
             start_to_close_timeout=timedelta(seconds=15),
         )
+
+        if summary_thread_ts:
+            await workflow.execute_activity(
+                store_summary_thread_ts,
+                args=[input.bug_id, summary_thread_ts],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
 
         # Step 7: If unresolved, escalate and start SLA tracking
         fix_type = investigation_dict.get("fix_type", "unknown")
@@ -123,4 +144,75 @@ class BugInvestigationWorkflow:
                 start_to_close_timeout=timedelta(seconds=10),
             )
 
-        return investigation_dict
+        # Step 8: Wait for developer reply (up to 48 hours)
+        claude_session_id = investigation_dict.get("claude_session_id")
+
+        condition_met = await workflow.wait_condition(
+            lambda: self._dev_reply is not None,
+            timeout=timedelta(hours=48),
+        )
+
+        if not condition_met:
+            workflow.logger.info(f"No developer reply received for {input.bug_id} within 48 hours")
+            return investigation_dict
+
+        # Developer replied — run follow-up investigation
+        dev_reply_data = self._dev_reply
+        self._dev_reply = None  # Reset for potential further replies
+
+        workflow.logger.info(
+            f"Developer replied to {input.bug_id} with reply_type={dev_reply_data['reply_type']}"
+        )
+
+        # Notify in original thread that follow-up is starting
+        await workflow.execute_activity(
+            post_slack_message,
+            PostMessageInput(
+                channel_id=input.channel_id,
+                thread_ts=input.thread_ts,
+                text=f":mag: Follow-up investigation started for {input.bug_id} based on developer feedback...",
+            ),
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        # Run follow-up investigation — resumes original Claude session
+        followup_result: dict = await workflow.execute_activity(
+            run_followup_investigation,
+            args=[
+                input.bug_id,
+                dev_reply_data["message"],
+                dev_reply_data["reply_type"],
+                claude_session_id,
+            ],
+            start_to_close_timeout=timedelta(minutes=15),
+            heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(
+                maximum_attempts=2,
+                initial_interval=timedelta(seconds=10),
+                backoff_coefficient=2.0,
+            ),
+        )
+
+        # Save follow-up results
+        await workflow.execute_activity(
+            save_investigation_result,
+            args=[input.bug_id, followup_result],
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+        # Post follow-up results to Slack
+        followup_results_input = PostResultsInput(
+            channel_id=input.channel_id,
+            thread_ts=input.thread_ts,
+            bug_id=input.bug_id,
+            severity=parsed.severity,
+            result=followup_result,
+        )
+
+        await workflow.execute_activity(
+            post_investigation_results,
+            followup_results_input,
+            start_to_close_timeout=timedelta(seconds=15),
+        )
+
+        return followup_result

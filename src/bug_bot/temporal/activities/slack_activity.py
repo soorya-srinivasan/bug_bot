@@ -78,14 +78,14 @@ async def post_investigation_results(input: PostResultsInput) -> None:
 
 
 @activity.defn
-async def create_summary_thread(input: PostResultsInput) -> None:
-    """Create a summary post in #bug-summaries channel."""
+async def create_summary_thread(input: PostResultsInput) -> str:
+    """Create a summary post in #bug-summaries channel. Returns the message ts."""
     if not _slack_configured():
         activity.logger.info(
             f"[Slack skip] Summary for {input.bug_id} (severity={input.severity}): "
             f"{input.result.get('summary')}"
         )
-        return
+        return ""
     client = _get_slack_client()
     blocks = format_summary_message(
         bug_id=input.bug_id,
@@ -94,11 +94,12 @@ async def create_summary_thread(input: PostResultsInput) -> None:
         original_channel=input.channel_id,
         original_thread_ts=input.thread_ts,
     )
-    await client.chat_postMessage(
+    response = await client.chat_postMessage(
         channel=settings.bug_summaries_channel_id,
         blocks=blocks,
         text=f"Bug summary: {input.bug_id}",  # fallback
     )
+    return response.get("ts", "")
 
 
 @activity.defn

@@ -8,4 +8,5 @@ slack_app = AsyncApp(
     signing_secret=settings.slack_signing_secret,
 )
 
+# HTTP mode handler (used when SLACK_SOCKET_MODE=false)
 slack_handler = AsyncSlackRequestHandler(slack_app)

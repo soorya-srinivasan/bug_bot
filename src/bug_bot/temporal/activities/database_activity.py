@@ -23,6 +23,15 @@ async def save_investigation_result(bug_id: str, result: dict) -> None:
 
 
 @activity.defn
+async def store_summary_thread_ts(bug_id: str, summary_thread_ts: str) -> None:
+    """Store the summary thread timestamp for a bug report."""
+    async with async_session() as session:
+        repo = BugRepository(session)
+        await repo.store_summary_thread_ts(bug_id, summary_thread_ts)
+    activity.logger.info(f"Summary thread_ts stored for bug {bug_id}: {summary_thread_ts}")
+
+
+@activity.defn
 async def get_sla_config_for_severity(severity: str) -> dict | None:
     """Fetch SLA configuration for a given severity level."""
     async with async_session() as session:

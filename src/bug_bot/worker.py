@@ -18,9 +18,13 @@ from bug_bot.temporal.activities.slack_activity import (
 from bug_bot.temporal.activities.database_activity import (
     update_bug_status,
     save_investigation_result,
+    store_summary_thread_ts,
     get_sla_config_for_severity,
 )
-from bug_bot.temporal.activities.agent_activity import run_agent_investigation
+from bug_bot.temporal.activities.agent_activity import (
+    run_agent_investigation,
+    run_followup_investigation,
+)
 
 
 async def main():
@@ -47,8 +51,10 @@ async def main():
             send_follow_up,
             update_bug_status,
             save_investigation_result,
+            store_summary_thread_ts,
             get_sla_config_for_severity,
             run_agent_investigation,
+            run_followup_investigation,
         ],
     )
 
