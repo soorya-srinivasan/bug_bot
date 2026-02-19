@@ -26,6 +26,12 @@ from bug_bot.schemas.admin import (
 router = APIRouter()
 
 
+def _slack_message_url(channel_id: str, thread_ts: str) -> str:
+    """Build Slack deep link to the bug report message (opens in user's workspace)."""
+    ts_no_dot = thread_ts.replace(".", "")
+    return f"https://slack.com/archives/{channel_id}/p{ts_no_dot}"
+
+
 async def get_repo() -> BugRepository:
     async with async_session() as session:
         yield BugRepository(session)
@@ -87,6 +93,8 @@ async def list_bugs(
                 id=str(bug.id),
                 bug_id=bug.bug_id,
                 slack_channel_id=bug.slack_channel_id,
+                slack_thread_ts=bug.slack_thread_ts,
+                slack_message_url=_slack_message_url(bug.slack_channel_id, bug.slack_thread_ts),
                 reporter_user_id=bug.reporter_user_id,
                 original_message=bug.original_message,
                 severity=bug.severity,
@@ -118,6 +126,8 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         id=str(bug.id),
         bug_id=bug.bug_id,
         slack_channel_id=bug.slack_channel_id,
+        slack_thread_ts=bug.slack_thread_ts,
+        slack_message_url=_slack_message_url(bug.slack_channel_id, bug.slack_thread_ts),
         reporter_user_id=bug.reporter_user_id,
         original_message=bug.original_message,
         severity=bug.severity,
@@ -159,6 +169,8 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         id=str(updated.id),
         bug_id=updated.bug_id,
         slack_channel_id=updated.slack_channel_id,
+        slack_thread_ts=updated.slack_thread_ts,
+        slack_message_url=_slack_message_url(updated.slack_channel_id, updated.slack_thread_ts),
         reporter_user_id=updated.reporter_user_id,
         original_message=updated.original_message,
         severity=updated.severity,

@@ -32,6 +32,8 @@ class BugListItem(BaseModel):
     id: str
     bug_id: str
     slack_channel_id: str
+    slack_thread_ts: str
+    slack_message_url: str
     reporter_user_id: str
     original_message: str
     severity: Severity
