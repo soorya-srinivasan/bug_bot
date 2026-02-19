@@ -19,15 +19,15 @@ def build_mcp_servers() -> dict:
         "args": ["-y", "@anthropic-ai/mcp-server-git"],
     }
 
-    # Grafana
-    if settings.grafana_url and settings.grafana_api_key:
+    # Grafana — API key is optional (works with anonymous admin access)
+    if settings.grafana_url:
+        grafana_env = {"GRAFANA_URL": settings.grafana_url}
+        if settings.grafana_api_key:
+            grafana_env["GRAFANA_API_KEY"] = settings.grafana_api_key
         servers["grafana"] = {
             "command": "npx",
             "args": ["-y", "@grafana/mcp-grafana"],
-            "env": {
-                "GRAFANA_URL": settings.grafana_url,
-                "GRAFANA_API_KEY": settings.grafana_api_key,
-            },
+            "env": grafana_env,
         }
 
     # New Relic
