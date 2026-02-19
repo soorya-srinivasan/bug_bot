@@ -1,8 +1,10 @@
+import asyncio
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from claude_agent_sdk import (
-    query,
+    ClaudeSDKClient,
     ClaudeAgentOptions,
     AssistantMessage,
     TextBlock,
@@ -14,6 +16,130 @@ from bug_bot.agent.tools import build_custom_tools_server
 from bug_bot.agent.prompts import build_investigation_prompt
 from bug_bot.config import settings
 
+# Increase SDK initialize timeout to 120s — handles slow Bun startup on CPUs without AVX.
+# The env var is in milliseconds; the SDK enforces a 60s minimum so 120000 gives 120s.
+os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "120000")
+
+# Dedicated thread pool for SDK calls.  Each call runs asyncio.run() in its own OS thread,
+# giving it a fresh event loop entirely separate from Temporal's.  This eliminates the
+# anyio cancel-scope / Temporal asyncio conflicts that cause premature initialize timeouts.
+_sdk_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bugbot-sdk")
+
+_OUTPUT_SCHEMA = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "root_cause": {"type": ["string", "null"]},
+            "fix_type": {
+                "type": "string",
+                "enum": ["code_fix", "data_fix", "config_fix", "needs_human", "unknown"],
+            },
+            "pr_url": {"type": ["string", "null"]},
+            "summary": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "recommended_actions": {"type": "array", "items": {"type": "string"}},
+            "relevant_services": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["fix_type", "summary", "confidence"],
+    },
+}
+
+_SYSTEM_PROMPT = (
+    "You are Bug Bot, an automated bug investigation agent for ShopTech. "
+    "You have access to Grafana, New Relic, GitHub, Git, PostgreSQL, and MySQL "
+    "via MCP servers. Your goal is to investigate bug reports, identify root causes, "
+    "and create fixes when possible.\n\n"
+    "For .NET services (OXO.APIs): check Grafana dashboards, look for common C#/.NET issues.\n"
+    "For Ruby/Rails services (vconnect): check New Relic APM, look for Rails-specific issues.\n\n"
+    "IMPORTANT: When creating code fixes:\n"
+    "- Clone repos to /tmp/bugbot-workspace/\n"
+    "- Branch naming: <bug_id>-<short-desc>\n"
+    "- Commit message: fix(<service>): <desc> [<bug_id>]\n"
+    "- Create a PR with the bug ID in the title\n"
+    "- Keep changes minimal — only fix the reported issue\n"
+    "- Never push to main/master directly\n\n"
+    "Always provide your findings in a structured format at the end."
+)
+
+
+def _build_options(resume: str | None = None) -> ClaudeAgentOptions:
+    mcp_servers = build_mcp_servers()
+    mcp_servers["bugbot_tools"] = build_custom_tools_server()
+
+    allowed_tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
+    for server_name in mcp_servers:
+        allowed_tools.append(f"mcp__{server_name}__*")
+
+    return ClaudeAgentOptions(
+        model="claude-sonnet-4-5-20250929",
+        permission_mode="bypassPermissions",
+        max_turns=50,
+        cwd="/tmp/bugbot-workspace",
+        cli_path=settings.claude_cli_path,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
+        system_prompt=_SYSTEM_PROMPT,
+        output_format=_OUTPUT_SCHEMA,
+        resume=resume,
+    )
+
+
+async def _collect_response(client: ClaudeSDKClient) -> tuple[dict | None, float | None, str | None, list]:
+    """Drain receive_response(), collecting result data and conversation history."""
+    result_data = None
+    total_cost = None
+    session_id = None
+    conversation_history = []
+
+    async for message in client.receive_response():
+        msg_record = {"type": type(message).__name__}
+        if isinstance(message, AssistantMessage):
+            text_parts = [
+                block.text for block in message.content if isinstance(block, TextBlock)
+            ]
+            msg_record["text"] = "\n".join(text_parts)
+        elif isinstance(message, ResultMessage):
+            result_data = message.structured_output
+            total_cost = message.total_cost_usd
+            session_id = message.session_id
+            # Do NOT store structured_output in msg_record — result_data IS that same
+            # dict object.  Storing it here and then doing result_data["conversation_history"]
+            # = conversation_history later creates a circular reference that breaks JSON serialization.
+        conversation_history.append(msg_record)
+
+    return result_data, total_cost, session_id, conversation_history
+
+
+def _run_sdk_sync(prompt: str, options: ClaudeAgentOptions) -> tuple:
+    """Run the SDK in a fresh asyncio event loop (called from a ThreadPoolExecutor thread).
+
+    Using asyncio.run() here creates a brand-new event loop for each call, completely
+    isolated from Temporal's event loop.  This prevents anyio cancel-scopes inside the
+    SDK from interfering with Temporal's own asyncio management.
+
+    CancelledError handling: anyio's fail_after() (used by the SDK for its initialize
+    handshake and version check) raises CancelledError when it times out.  In Python 3.8+
+    CancelledError is a BaseException — it bypasses except Exception handlers and would
+    propagate to Temporal as a task cancellation.  We catch it here and convert it to a
+    plain RuntimeError so Temporal treats it as a normal activity failure.
+    """
+    async def _inner():
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            return await _collect_response(client)
+
+    try:
+        return asyncio.run(_inner())
+    except asyncio.CancelledError as e:
+        raise RuntimeError(
+            "Claude SDK subprocess timed out during initialization. "
+            "This is likely caused by slow Bun startup on CPUs without AVX support. "
+            "Install the baseline Bun build: "
+            "https://github.com/oven-sh/bun/releases/download/bun-v1.3.10/bun-darwin-x64-baseline.zip — "
+            f"original error: {e}"
+        ) from e
+
 
 async def run_investigation(
     bug_id: str,
@@ -22,93 +148,22 @@ async def run_investigation(
     relevant_services: list[str],
 ) -> dict:
     """Run a Claude Agent SDK investigation for the given bug."""
-    workspace = "/tmp/bugbot-workspace"
-    os.makedirs(workspace, exist_ok=True)
-
+    os.makedirs("/tmp/bugbot-workspace", exist_ok=True)
     start_time = time.time()
 
-    mcp_servers = build_mcp_servers()
-    custom_server = build_custom_tools_server()
-
-    # Add custom tools server
-    mcp_servers["bugbot_tools"] = custom_server
-
-    # Build allowed tools list — allow all MCP tools + file tools
-    allowed_tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
-    for server_name in mcp_servers:
-        allowed_tools.append(f"mcp__{server_name}__*")
-
-    options = ClaudeAgentOptions(
-        model="claude-sonnet-4-5-20250929",
-        permission_mode="bypassPermissions",
-        max_turns=50,
-        cwd="/tmp/bugbot-workspace",
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        system_prompt=(
-            "You are Bug Bot, an automated bug investigation agent for ShopTech. "
-            "You have access to Grafana, New Relic, GitHub, Git, PostgreSQL, and MySQL "
-            "via MCP servers. Your goal is to investigate bug reports, identify root causes, "
-            "and create fixes when possible.\n\n"
-            "For .NET services (OXO.APIs): check Grafana dashboards, look for common C#/.NET issues.\n"
-            "For Ruby/Rails services (vconnect): check New Relic APM, look for Rails-specific issues.\n\n"
-            "IMPORTANT: When creating code fixes:\n"
-            "- Clone repos to /tmp/bugbot-workspace/\n"
-            "- Branch naming: <bug_id>-<short-desc>\n"
-            "- Commit message: fix(<service>): <desc> [<bug_id>]\n"
-            "- Create a PR with the bug ID in the title\n"
-            "- Keep changes minimal — only fix the reported issue\n"
-            "- Never push to main/master directly\n\n"
-            "Always provide your findings in a structured format at the end."
-        ),
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "root_cause": {"type": ["string", "null"]},
-                    "fix_type": {
-                        "type": "string",
-                        "enum": ["code_fix", "data_fix", "config_fix", "needs_human", "unknown"],
-                    },
-                    "pr_url": {"type": ["string", "null"]},
-                    "summary": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "recommended_actions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "relevant_services": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": ["fix_type", "summary", "confidence"],
-            },
-        },
-    )
-
     prompt = build_investigation_prompt(bug_id, description, severity, relevant_services)
+    options = _build_options()
 
-    result_data = None
-    total_cost = None
-    session_id = None
-    conversation_history = []
-
-    async for message in query(prompt=prompt, options=options):
-        msg_record = {"type": type(message).__name__}
-        if isinstance(message, AssistantMessage):
-            text_parts = []
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    text_parts.append(block.text)
-            msg_record["text"] = "\n".join(text_parts)
-        elif isinstance(message, ResultMessage):
-            msg_record["structured_output"] = message.structured_output
-            result_data = message.structured_output
-            total_cost = getattr(message, "total_cost_usd", None)
-            session_id = getattr(message, "session_id", None)
-        conversation_history.append(msg_record)
+    _claudecode_env = os.environ.pop("CLAUDECODE", None)
+    try:
+        loop = asyncio.get_event_loop()
+        result_data, total_cost, session_id, conversation_history = await loop.run_in_executor(
+            _sdk_executor,
+            lambda: _run_sdk_sync(prompt, options),
+        )
+    finally:
+        if _claudecode_env is not None:
+            os.environ["CLAUDECODE"] = _claudecode_env
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 
@@ -137,70 +192,32 @@ async def run_followup(
     reply_type: str,
     claude_session_id: str | None = None,
 ) -> dict:
-    """Run a follow-up investigation by resuming the original Claude session."""
-    workspace = "/tmp/bugbot-workspace"
-    os.makedirs(workspace, exist_ok=True)
-
+    """Resume the original Claude session and run a follow-up investigation."""
+    os.makedirs("/tmp/bugbot-workspace", exist_ok=True)
     start_time = time.time()
-
-    mcp_servers = build_mcp_servers()
-    custom_server = build_custom_tools_server()
-    mcp_servers["bugbot_tools"] = custom_server
-
-    allowed_tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
-    for server_name in mcp_servers:
-        allowed_tools.append(f"mcp__{server_name}__*")
 
     prompt = (
         f"A developer has replied to your investigation of bug {bug_id} ({reply_type}):\n\n"
         f"{dev_message}\n\n"
-        f"{'Attempt to create a code fix and open a PR.' if reply_type == 'approve' else 'Use this additional context to refine your analysis and provide updated findings.'}"
+        + (
+            "Attempt to create a code fix and open a PR."
+            if reply_type == "approve"
+            else "Use this additional context to refine your analysis and provide updated findings."
+        )
     )
 
-    options = ClaudeAgentOptions(
-        model="claude-sonnet-4-5-20250929",
-        permission_mode="bypassPermissions",
-        max_turns=50,
-        cwd="/tmp/bugbot-workspace",
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed_tools,
-        resume=claude_session_id,  # Resume the exact session — full context preserved
-        output_format={
-            "type": "json_schema",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "root_cause": {"type": ["string", "null"]},
-                    "fix_type": {
-                        "type": "string",
-                        "enum": ["code_fix", "data_fix", "config_fix", "needs_human", "unknown"],
-                    },
-                    "pr_url": {"type": ["string", "null"]},
-                    "summary": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "recommended_actions": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "relevant_services": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": ["fix_type", "summary", "confidence"],
-            },
-        },
-    )
+    options = _build_options(resume=claude_session_id)
 
-    result_data = None
-    total_cost = None
-    new_session_id = None
-
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, ResultMessage):
-            result_data = message.structured_output
-            total_cost = getattr(message, "total_cost_usd", None)
-            new_session_id = getattr(message, "session_id", None)
+    _claudecode_env = os.environ.pop("CLAUDECODE", None)
+    try:
+        loop = asyncio.get_event_loop()
+        result_data, total_cost, new_session_id, _ = await loop.run_in_executor(
+            _sdk_executor,
+            lambda: _run_sdk_sync(prompt, options),
+        )
+    finally:
+        if _claudecode_env is not None:
+            os.environ["CLAUDECODE"] = _claudecode_env
 
     elapsed_ms = int((time.time() - start_time) * 1000)
 

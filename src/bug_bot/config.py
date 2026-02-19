@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # Anthropic
     anthropic_api_key: str = ""
+    claude_cli_path: str = "/usr/local/bin/claude"
 
     # GitHub
     github_token: str = ""
