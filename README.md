@@ -16,3 +16,5 @@ Bug Bot
   python -m bug_bot.worker
 
   psql --host=localhost --port=5433 --username=bugbot --dbname=bugbot
+
+
