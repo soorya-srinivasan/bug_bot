@@ -96,6 +96,21 @@ class Escalation(Base):
     bug_report: Mapped["BugReport"] = relationship(back_populates="escalations")
 
 
+class ServiceGroup(Base):
+    __tablename__ = "service_groups"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Slack user group ID (from GET /slack/user-groups) — source of group identity.
+    # Names and handles come from the Slack API; we don't duplicate them here.
+    slack_group_id: Mapped[str] = mapped_column(String(30), unique=True, nullable=False)
+    oncall_engineer: Mapped[str | None] = mapped_column(String(20))  # Slack user ID
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    services: Mapped[list["ServiceTeamMapping"]] = relationship(back_populates="group")
+
+
 class ServiceTeamMapping(Base):
     __tablename__ = "service_team_mapping"
 
@@ -105,7 +120,12 @@ class ServiceTeamMapping(Base):
     team_slack_group: Mapped[str | None] = mapped_column(String(30))
     primary_oncall: Mapped[str | None] = mapped_column(String(20))
     tech_stack: Mapped[str] = mapped_column(String(20), nullable=False)
+    service_owner: Mapped[str | None] = mapped_column(String(20))  # permanent tech owner Slack ID
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_groups.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    group: Mapped["ServiceGroup | None"] = relationship(back_populates="services")
 
 
 class BugConversation(Base):

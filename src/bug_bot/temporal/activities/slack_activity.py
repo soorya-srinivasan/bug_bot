@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from temporalio import activity
 
@@ -40,6 +40,7 @@ class EscalationInput:
     severity: str
     relevant_services: list[str]
     escalation_level: int = 1
+    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, slack_group_id}, ...]
 
 
 @activity.defn
@@ -115,14 +116,27 @@ async def escalate_to_humans(input: EscalationInput) -> None:
         f"Services: {', '.join(input.relevant_services) or 'Unknown'} — "
         f"Requires human investigation."
     )
+
+    parts = []
+    for entry in input.oncall_entries:
+        if entry.get("slack_group_id"):
+            parts.append(f"<!subteam^{entry['slack_group_id']}>")
+        elif entry.get("oncall_engineer"):
+            parts.append(f"<@{entry['oncall_engineer']}>")
+    mention_str = " ".join(parts)
+
+    text = f":rotating_light: *{msg}*"
+    if mention_str:
+        text += f"\n{mention_str} please investigate."
+
     if not _slack_configured():
-        activity.logger.info(f"[Slack skip] {msg}")
+        activity.logger.info(f"[Slack skip] {text}")
         return
     client = _get_slack_client()
     await client.chat_postMessage(
         channel=input.channel_id,
         thread_ts=input.thread_ts,
-        text=f":rotating_light: *{msg}*",
+        text=text,
     )
 
 

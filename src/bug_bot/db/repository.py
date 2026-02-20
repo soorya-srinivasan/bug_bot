@@ -1,9 +1,10 @@
 from datetime import datetime
 
 from sqlalchemy import Select, desc, func, select, update
+from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bug_bot.models.models import BugReport, BugConversation, Investigation, SLAConfig, Escalation, ServiceTeamMapping
+from bug_bot.models.models import BugReport, BugConversation, Investigation, SLAConfig, Escalation, ServiceTeamMapping, ServiceGroup
 
 
 class BugRepository:
@@ -238,7 +239,11 @@ class BugRepository:
         return list(result.scalars().all()), total_count
 
     async def get_service_mapping_by_id(self, id_: str) -> ServiceTeamMapping | None:
-        stmt = select(ServiceTeamMapping).where(ServiceTeamMapping.id == id_)  # type: ignore[arg-type]
+        stmt = (
+            select(ServiceTeamMapping)
+            .options(selectinload(ServiceTeamMapping.group))
+            .where(ServiceTeamMapping.id == id_)  # type: ignore[arg-type]
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -269,6 +274,79 @@ class BugRepository:
             return
         await self.session.delete(mapping)
         await self.session.commit()
+
+    # ── ServiceGroup CRUD ──────────────────────────────────────────────────────
+
+    async def create_service_group(self, data: dict) -> ServiceGroup:
+        group = ServiceGroup(**data)
+        self.session.add(group)
+        await self.session.commit()
+        await self.session.refresh(group)
+        return group
+
+    async def get_service_group_by_id(self, id_: str) -> ServiceGroup | None:
+        stmt = select(ServiceGroup).where(ServiceGroup.id == id_)  # type: ignore[arg-type]
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_service_groups(
+        self, *, page: int = 1, page_size: int = 50
+    ) -> tuple[list[ServiceGroup], int]:
+        stmt: Select = select(ServiceGroup)
+        total = await self.session.execute(
+            stmt.with_only_columns(func.count()).order_by(None)
+        )
+        total_count = int(total.scalar_one())
+        offset = (page - 1) * page_size
+        stmt = stmt.order_by(ServiceGroup.created_at).offset(offset).limit(page_size)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total_count
+
+    async def update_service_group(self, id_: str, data: dict) -> ServiceGroup | None:
+        if not data:
+            return await self.get_service_group_by_id(id_)
+        stmt = (
+            update(ServiceGroup)
+            .where(ServiceGroup.id == id_)  # type: ignore[arg-type]
+            .values(**data, updated_at=datetime.utcnow())
+            .returning(ServiceGroup)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.scalar_one_or_none()
+
+    async def delete_service_group(self, id_: str) -> None:
+        group = await self.get_service_group_by_id(id_)
+        if group is None:
+            return
+        await self.session.delete(group)
+        await self.session.commit()
+
+    async def get_oncall_for_services(self, service_names: list[str]) -> list[dict]:
+        """Return deduped on-call info for given services.
+
+        Prefers group oncall_engineer; falls back to service primary_oncall.
+        """
+        if not service_names:
+            return []
+        stmt = (
+            select(ServiceTeamMapping, ServiceGroup)
+            .outerjoin(ServiceGroup, ServiceTeamMapping.group_id == ServiceGroup.id)
+            .where(func.lower(ServiceTeamMapping.service_name).in_(
+                [s.lower() for s in service_names]
+            ))
+        )
+        results = await self.session.execute(stmt)
+        seen: set[str] = set()
+        entries: list[dict] = []
+        for mapping, group in results.all():
+            oncall = (group.oncall_engineer if group else None) or mapping.primary_oncall
+            slack_group_id = group.slack_group_id if group else None
+            key = slack_group_id or oncall or ""
+            if key and key not in seen:
+                seen.add(key)
+                entries.append({"oncall_engineer": oncall, "slack_group_id": slack_group_id})
+        return entries
 
     async def get_bug_by_thread_ts(self, channel_id: str, thread_ts: str) -> BugReport | None:
         stmt = select(BugReport).where(

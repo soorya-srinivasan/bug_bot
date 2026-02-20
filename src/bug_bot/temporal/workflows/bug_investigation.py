@@ -23,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
         save_investigation_result,
         store_summary_thread_ts,
         log_conversation_event,
+        fetch_oncall_for_services,
     )
     from bug_bot.temporal.activities.agent_activity import (
         run_agent_investigation,
@@ -217,12 +218,18 @@ class BugInvestigationWorkflow:
 
             # ── Escalate if needed (SLA child runs in parallel; we still wait) ─
             if action == "escalate":
+                oncall_entries: list[dict] = await workflow.execute_activity(
+                    fetch_oncall_for_services,
+                    args=[investigation_dict.get("relevant_services", [])],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
                 await workflow.execute_activity(
                     escalate_to_humans,
                     EscalationInput(
                         channel_id=input.channel_id, thread_ts=input.thread_ts,
                         bug_id=input.bug_id, severity=parsed.severity,
                         relevant_services=investigation_dict.get("relevant_services", []),
+                        oncall_entries=oncall_entries,
                     ),
                     start_to_close_timeout=timedelta(seconds=15),
                 )

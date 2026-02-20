@@ -21,6 +21,7 @@ from bug_bot.temporal.activities.database_activity import (
     store_summary_thread_ts,
     get_sla_config_for_severity,
     log_conversation_event,
+    fetch_oncall_for_services,
 )
 from bug_bot.temporal.activities.agent_activity import (
     run_agent_investigation,
@@ -59,6 +60,7 @@ async def main():
             run_continuation_investigation,
             cleanup_workspace,
             log_conversation_event,
+            fetch_oncall_for_services,
         ],
     )
 
