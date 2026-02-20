@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import timedelta
 
 from temporalio import workflow
@@ -185,9 +186,19 @@ class BugInvestigationWorkflow:
             # Create the #bug-summaries thread only on the first post; subsequent
             # investigation results are posted into the existing thread by
             # post_investigation_results using the stored summary_thread_ts.
+            # Fetch on-call for relevant services so we tag them in the summary channel.
             if not self._summary_thread_created:
+                # Use agent-detected services if available, otherwise fall back to parsed services
+                relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
+                workflow.logger.info(f"Fetching on-call for services: {relevant_services}")
+                oncall_entries: list[dict] = await workflow.execute_activity(
+                    fetch_oncall_for_services,
+                    args=[relevant_services],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+                summary_input = replace(results_input, oncall_entries=oncall_entries)
                 summary_thread_ts: str = await workflow.execute_activity(
-                    create_summary_thread, results_input,
+                    create_summary_thread, summary_input,
                     start_to_close_timeout=timedelta(seconds=15),
                 )
                 if summary_thread_ts:
@@ -218,9 +229,12 @@ class BugInvestigationWorkflow:
 
             # ── Escalate if needed (SLA child runs in parallel; we still wait) ─
             if action == "escalate":
+                # Use agent-detected services if available, otherwise fall back to parsed services
+                relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
+                workflow.logger.info(f"Escalating - fetching on-call for services: {relevant_services}")
                 oncall_entries: list[dict] = await workflow.execute_activity(
                     fetch_oncall_for_services,
-                    args=[investigation_dict.get("relevant_services", [])],
+                    args=[relevant_services],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
                 await workflow.execute_activity(
@@ -228,7 +242,7 @@ class BugInvestigationWorkflow:
                     EscalationInput(
                         channel_id=input.channel_id, thread_ts=input.thread_ts,
                         bug_id=input.bug_id, severity=parsed.severity,
-                        relevant_services=investigation_dict.get("relevant_services", []),
+                        relevant_services=relevant_services,
                         oncall_entries=oncall_entries,
                     ),
                     start_to_close_timeout=timedelta(seconds=15),
