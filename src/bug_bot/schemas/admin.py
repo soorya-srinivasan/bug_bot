@@ -368,3 +368,12 @@ class InvestigationFindingResponse(BaseModel):
 class InvestigationFindingListResponse(BaseModel):
     items: list[InvestigationFindingResponse]
 
+
+class NudgeResponse(BaseModel):
+    """Result of sending a Slack nudge to tagged on-call engineers."""
+
+    bug_id: str
+    nudged_users: list[str]
+    failed_users: list[str]
+    message: str
+

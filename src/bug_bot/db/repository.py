@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from sqlalchemy import Select, desc, func, select, update, and_, or_
 from sqlalchemy.orm import selectinload
@@ -48,7 +48,7 @@ class BugRepository:
         stmt = (
             update(BugReport)
             .where(BugReport.bug_id == bug_id)
-            .values(assignee_user_id=user_id, updated_at=datetime.utcnow())
+            .values(assignee_user_id=user_id, updated_at=datetime.now(timezone.utc))
         )
         await self.session.execute(stmt)
         await self.session.commit()
@@ -57,10 +57,10 @@ class BugRepository:
         stmt = (
             update(BugReport)
             .where(BugReport.bug_id == bug_id)
-            .values(status=status, updated_at=datetime.utcnow())
+            .values(status=status, updated_at=datetime.now(timezone.utc))
         )
         if status == "resolved":
-            stmt = stmt.values(resolved_at=datetime.utcnow())
+            stmt = stmt.values(resolved_at=datetime.now(timezone.utc))
         await self.session.execute(stmt)
         await self.session.commit()
 
@@ -131,13 +131,13 @@ class BugRepository:
         severity: str | None = None,
         status: str | None = None,
     ) -> BugReport | None:
-        values: dict = {"updated_at": datetime.utcnow()}
+        values: dict = {"updated_at": datetime.now(timezone.utc)}
         if severity is not None:
             values["severity"] = severity
         if status is not None:
             values["status"] = status
             if status == "resolved":
-                values["resolved_at"] = datetime.utcnow()
+                values["resolved_at"] = datetime.now(timezone.utc)
 
         if len(values) == 1:  # only updated_at
             return await self.get_bug_by_id(bug_id)
@@ -207,7 +207,7 @@ class BugRepository:
         stmt = (
             update(SLAConfig)
             .where(SLAConfig.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(SLAConfig)
         )
         result = await self.session.execute(stmt)
@@ -218,7 +218,7 @@ class BugRepository:
         stmt = (
             update(SLAConfig)
             .where(SLAConfig.id == id_)  # type: ignore[arg-type]
-            .values(is_active=False, updated_at=datetime.utcnow())
+            .values(is_active=False, updated_at=datetime.now(timezone.utc))
         )
         await self.session.execute(stmt)
         await self.session.commit()
@@ -336,7 +336,7 @@ class BugRepository:
         stmt = (
             update(Team)
             .where(Team.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(Team)
         )
         result = await self.session.execute(stmt)
@@ -695,7 +695,7 @@ class BugRepository:
         stmt = (
             update(OnCallSchedule)
             .where(OnCallSchedule.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(OnCallSchedule)
         )
         result = await self.session.execute(stmt)
