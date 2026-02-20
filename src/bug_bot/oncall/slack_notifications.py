@@ -1,10 +1,13 @@
 """Slack notifications for on-call assignments."""
 
+import logging
 from datetime import date
 
 from slack_sdk.web.async_client import AsyncWebClient
 
 from bug_bot.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _get_slack_client() -> AsyncWebClient:
@@ -139,6 +142,86 @@ async def notify_oncall_assignment(
         return True
     except Exception:
         return False
+
+
+async def send_nudge(
+    engineer_slack_id: str,
+    bug_id: str,
+    severity: str,
+    original_message: str,
+    slack_message_url: str | None = None,
+    summary: str | None = None,
+) -> str | None:
+    """Send a Slack DM nudging an on-call engineer about a bug.
+
+    Returns ``None`` on success, or an error description string on failure.
+    """
+    if not _slack_configured():
+        return "Slack is not configured"
+
+    snippet = (original_message[:200] + "…") if len(original_message) > 200 else original_message
+
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"👋 Nudge: {bug_id}", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Severity:*\n{severity}"},
+                {"type": "mrkdwn", "text": f"*Bug ID:*\n{bug_id}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Report:*\n> {snippet}"},
+        },
+    ]
+
+    if summary:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Investigation summary:*\n{summary}"},
+        })
+
+    if slack_message_url:
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View in Slack", "emoji": True},
+                    "url": slack_message_url,
+                    "action_id": "nudge_view_slack",
+                },
+            ],
+        })
+
+    fallback_text = f"Nudge: {bug_id} ({severity}) — {snippet}"
+
+    client = _get_slack_client()
+    try:
+        dm_response = await client.conversations_open(users=[engineer_slack_id])
+        if not dm_response.get("ok"):
+            error = dm_response.get("error", "unknown")
+            logger.warning("send_nudge: conversations_open failed for %s: %s", engineer_slack_id, error)
+            return f"Could not open DM: {error}"
+
+        channel_id = dm_response.get("channel", {}).get("id")
+        if not channel_id:
+            logger.warning("send_nudge: no channel_id returned for %s", engineer_slack_id)
+            return "Could not resolve DM channel"
+
+        await client.chat_postMessage(
+            channel=channel_id,
+            text=fallback_text,
+            blocks=blocks,
+        )
+        return None
+    except Exception as exc:
+        logger.exception("send_nudge: failed for %s on %s", engineer_slack_id, bug_id)
+        return str(exc)
 
 
 async def notify_oncall_rotation(
