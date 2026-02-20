@@ -1,10 +1,55 @@
+def build_continuation_prompt(bug_id: str, conversation_ids: list[str], state: str) -> str:
+    count = len(conversation_ids)
+    if count:
+        id_list = ", ".join(conversation_ids)
+        recent = (
+            f"{count} new message(s) arrived since your last turn "
+            f"(conversation IDs: {id_list})."
+        )
+    else:
+        recent = "No new messages since your last turn (continuing after timeout)."
+
+    instruction = (
+        f'Start by calling get_bug_conversations(bug_id="{bug_id}") to review the full '
+        "conversation history for this bug. The most recent entries correspond to the "
+        f"new message(s) above. Do not repeat a clarification question the reporter "
+        "already answered — use the recorded answer in the history."
+    )
+    if state == "awaiting_reporter":
+        instruction += (
+            " The reporter's response is the most recent REPORTER entry in the history."
+        )
+    elif state == "awaiting_dev":
+        instruction += (
+            " If a developer message asks for a fix or PR, proceed with creating it. "
+            "If the developer asks to close or resolve this bug, set action='resolved'."
+        )
+    return f"{recent}\n\n{instruction}"
+
+
 def build_investigation_prompt(
     bug_id: str,
     description: str,
     severity: str,
     relevant_services: list[str],
+    attachments: list[dict] | None = None,
 ) -> str:
     services_str = ", ".join(relevant_services) if relevant_services else "unknown"
+
+    attachments_section = ""
+    if attachments:
+        lines = [
+            f"- `{a['name']}` ({a.get('mimetype', 'unknown type')}) — available at `./attachments/{a['name']}`"
+            for a in attachments
+            if a.get("name")
+        ]
+        if lines:
+            attachments_section = (
+                "\n\n## Attachments\n"
+                "The reporter attached the following files. They have been downloaded to your workspace:\n"
+                + "\n".join(lines)
+                + "\nUse the Read tool to inspect text/log files, or rely on your vision capability for images."
+            )
 
     return f"""Investigate the following bug report and provide a structured analysis.
 
@@ -14,7 +59,7 @@ def build_investigation_prompt(
 - **Potentially Affected Services:** {services_str}
 
 ## Report Content
-{description}
+{description}{attachments_section}
 
 ## Investigation Steps
 Follow these steps in order:

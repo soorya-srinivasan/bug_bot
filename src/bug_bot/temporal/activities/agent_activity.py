@@ -1,6 +1,71 @@
+import asyncio
+import os
+import shutil
+
+import httpx
 from temporalio import activity
 
 from bug_bot.config import settings
+
+
+async def _run_with_heartbeat(coro, heartbeat_secs: float = 30.0):
+    """Await *coro* while sending Temporal heartbeats every `heartbeat_secs` seconds.
+
+    Temporal cancels an activity if it doesn't receive a heartbeat within
+    `heartbeat_timeout`.  Long-running SDK calls (which can take 10+ minutes)
+    must heartbeat to prevent spurious cancellations and retries.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=heartbeat_secs)
+            except asyncio.TimeoutError:
+                activity.heartbeat()
+    except BaseException:
+        task.cancel()
+        raise
+
+
+async def _download_attachments(bug_id: str, attachments: list[dict]) -> list[dict]:
+    """Download Slack private files to the per-bug workspace. Returns list with local_path added."""
+    if not attachments:
+        return []
+
+    attachments_dir = f"/tmp/bugbot-workspace/{bug_id}/attachments"
+    os.makedirs(attachments_dir, exist_ok=True)
+
+    downloaded = []
+    async with httpx.AsyncClient() as http:
+        for att in attachments:
+            url = att.get("url_private")
+            name = att.get("name", "attachment")
+            if not url:
+                downloaded.append(att)
+                continue
+            try:
+                resp = await http.get(
+                    url,
+                    headers={"Authorization": f"Bearer {settings.slack_bot_token}"},
+                    follow_redirects=True,
+                    timeout=30.0,
+                )
+                if resp.status_code == 200:
+                    local_path = f"{attachments_dir}/{name}"
+                    with open(local_path, "wb") as f:
+                        f.write(resp.content)
+                    downloaded.append({**att, "local_path": f"./attachments/{name}"})
+                    activity.logger.info(f"Downloaded attachment '{name}' for {bug_id}")
+                else:
+                    activity.logger.warning(
+                        f"Failed to download '{name}' for {bug_id}: HTTP {resp.status_code}"
+                    )
+                    downloaded.append(att)
+            except Exception as e:
+                activity.logger.warning(f"Error downloading attachment '{name}' for {bug_id}: {e}")
+                downloaded.append(att)
+
+    return downloaded
 
 
 @activity.defn
@@ -9,12 +74,17 @@ async def run_agent_investigation(
     description: str,
     severity: str,
     relevant_services: list[str],
+    attachments: list[dict] | None = None,
 ) -> dict:
     """Invoke Claude Agent SDK to investigate the bug."""
     activity.logger.info(
         f"Starting agent investigation for {bug_id} (severity={severity}, "
-        f"services={relevant_services})"
+        f"services={relevant_services}, attachments={len(attachments or [])})"
     )
+
+    # Download Slack attachments into the per-bug workspace before starting the agent
+    if attachments:
+        attachments = await _download_attachments(bug_id, attachments)
 
     # Check if API key is configured
     # if not settings.anthropic_api_key or settings.anthropic_api_key.startswith("sk-ant-your"):
@@ -40,11 +110,14 @@ async def run_agent_investigation(
     try:
         from bug_bot.agent.runner import run_investigation
 
-        result = await run_investigation(
-            bug_id=bug_id,
-            description=description,
-            severity=severity,
-            relevant_services=relevant_services,
+        result = await _run_with_heartbeat(
+            run_investigation(
+                bug_id=bug_id,
+                description=description,
+                severity=severity,
+                relevant_services=relevant_services,
+                attachments=attachments,
+            )
         )
         activity.logger.info(
             f"Investigation complete for {bug_id}: fix_type={result['fix_type']}, "
@@ -87,35 +160,38 @@ async def run_agent_investigation(
 
 
 @activity.defn
-async def run_followup_investigation(
+async def run_continuation_investigation(
     bug_id: str,
-    dev_message: str,
-    reply_type: str,
+    conversation_ids: list[str],
+    state: str,
     claude_session_id: str | None = None,
 ) -> dict:
-    """Run a follow-up investigation by resuming the original Claude session."""
+    """Run a continuation investigation by resuming the original Claude session."""
     activity.logger.info(
-        f"Starting follow-up investigation for {bug_id} "
-        f"(reply_type={reply_type}, session_id={claude_session_id})"
+        f"Starting continuation investigation for {bug_id} "
+        f"(state={state}, new_messages={len(conversation_ids)}, session_id={claude_session_id})"
     )
 
     try:
-        from bug_bot.agent.runner import run_followup
+        from bug_bot.agent.runner import run_continuation
 
-        result = await run_followup(
-            bug_id=bug_id,
-            dev_message=dev_message,
-            reply_type=reply_type,
-            claude_session_id=claude_session_id,
+        result = await _run_with_heartbeat(
+            run_continuation(
+                bug_id=bug_id,
+                conversation_ids=conversation_ids,
+                state=state,
+                claude_session_id=claude_session_id,
+            )
         )
     except BaseException as e:
-        activity.logger.error(f"Follow-up investigation failed for {bug_id}: {e}")
+        activity.logger.error(f"Continuation investigation failed for {bug_id}: {e}")
         return {
             "root_cause": None,
             "fix_type": "needs_human",
+            "action": "escalate",
             "pr_url": None,
             "summary": (
-                f"Follow-up investigation for `{bug_id}` failed: "
+                f"Continuation investigation for `{bug_id}` failed: "
                 f"{type(e).__name__}: {e}"
             ),
             "confidence": 0.0,
@@ -126,8 +202,19 @@ async def run_followup_investigation(
         }
 
     activity.logger.info(
-        f"Follow-up complete for {bug_id}: fix_type={result['fix_type']}, "
-        f"confidence={result.get('confidence', 0)}"
+        f"Continuation complete for {bug_id}: fix_type={result['fix_type']}, "
+        f"action={result.get('action')}, confidence={result.get('confidence', 0)}"
     )
 
     return result
+
+
+@activity.defn
+async def cleanup_workspace(bug_id: str) -> None:
+    """Remove the per-bug workspace directory after workflow completion."""
+    workspace = f"/tmp/bugbot-workspace/{bug_id}"
+    try:
+        shutil.rmtree(workspace, ignore_errors=True)
+        activity.logger.info(f"Cleaned up workspace for {bug_id}: {workspace}")
+    except Exception as e:
+        activity.logger.warning(f"Failed to clean workspace for {bug_id}: {e}")

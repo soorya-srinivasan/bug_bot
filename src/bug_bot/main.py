@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -15,13 +14,9 @@ from bug_bot.temporal.workflows.bug_investigation import BugInvestigationWorkflo
 from bug_bot.slack.app import slack_app, slack_handler
 from bug_bot.slack.handlers import register_handlers
 from bug_bot.triage import triage_bug_report
+from bug_bot.api.routes import router as api_router
 
 logger = logging.getLogger(__name__)
-
-_APPROVE_RE = re.compile(
-    r'\b(go ahead|lgtm|create pr|yes|approved|ship it|approve|do it|proceed|looks good)\b',
-    re.IGNORECASE,
-)
 
 
 @asynccontextmanager
@@ -47,6 +42,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Bug Bot", lifespan=lifespan)
+app.include_router(api_router)
 
 
 @app.get("/health")
@@ -125,23 +121,6 @@ async def report_bug(payload: BugReportRequest):
     }
 
 
-@app.post("/api/resolve-bug/{bug_id}")
-async def resolve_bug(bug_id: str):
-    """Mark a bug as resolved (local testing, no Slack needed)."""
-    temporal = await get_temporal_client()
-    try:
-        handle = temporal.get_workflow_handle(f"sla-{bug_id}")
-        await handle.signal("mark_resolved")
-    except Exception:
-        pass
-
-    async with async_session() as session:
-        repo = BugRepository(session)
-        await repo.update_status(bug_id, "resolved")
-
-    return {"status": "resolved", "bug_id": bug_id}
-
-
 @app.post("/api/triage")
 async def triage_only(payload: BugReportRequest):
     """Run triage classification without starting an investigation."""
@@ -156,15 +135,53 @@ class DevReplyRequest(BaseModel):
 @app.post("/api/dev-reply/{bug_id}")
 async def dev_reply(bug_id: str, payload: DevReplyRequest):
     """Signal the Bug Bot workflow with a developer reply (local testing)."""
-    intent = "approve" if _APPROVE_RE.search(payload.message) else "context"
     workflow_id = f"bug-{bug_id}"
     temporal = await get_temporal_client()
     handle = temporal.get_workflow_handle(workflow_id)
     try:
-        await handle.signal(BugInvestigationWorkflow.dev_reply, args=[payload.message, intent])
+        async with async_session() as session:
+            repo = BugRepository(session)
+            convo = await repo.log_conversation(
+                bug_id=bug_id,
+                message_type="dev_reply",
+                sender_type="developer",
+                sender_id="local-tester",
+                message_text=payload.message,
+            )
+            convo_id = str(convo.id)
+        await handle.signal(
+            BugInvestigationWorkflow.incoming_message,
+            args=["developer", "local-tester", convo_id],
+        )
     except Exception as e:
         return {"status": "error", "bug_id": bug_id, "error": str(e)}
-    return {"status": "signaled", "bug_id": bug_id, "intent": intent, "workflow_id": workflow_id}
+    return {"status": "signaled", "bug_id": bug_id, "workflow_id": workflow_id}
+
+
+@app.post("/api/reporter-info/{bug_id}")
+async def reporter_info(bug_id: str, payload: DevReplyRequest):
+    """Signal the workflow with reporter context (local testing)."""
+    workflow_id = f"bug-{bug_id}"
+    temporal = await get_temporal_client()
+    handle = temporal.get_workflow_handle(workflow_id)
+    try:
+        async with async_session() as session:
+            repo = BugRepository(session)
+            convo = await repo.log_conversation(
+                bug_id=bug_id,
+                message_type="reporter_reply",
+                sender_type="reporter",
+                sender_id="local-tester",
+                message_text=payload.message,
+            )
+            convo_id = str(convo.id)
+        await handle.signal(
+            BugInvestigationWorkflow.incoming_message,
+            args=["reporter", "local-tester", convo_id],
+        )
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    return {"status": "signaled", "bug_id": bug_id}
 
 
 @app.get("/api/bug/{bug_id}")

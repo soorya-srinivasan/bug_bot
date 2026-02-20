@@ -1,0 +1,123 @@
+Slack fix everyting:
+    Incoming
+    Reply
+    FollowUp Replies
+
+How workflow will work on followups replies from slack?
+
+
+Dashboard with some basic view and actions to perform
+Slack reply inside thread on followup in summary page
+Claude agent not working as expected
+
+
+* Only consider replies from the summary channel as dev reply:
+* If more details are needed even for initial bug_investigation check if you can get more details from the user
+* Once he replies start the bug_investigation again
+* store the conversations/replies in a table for future debugging and analysis
+* How to handle multiple messages from two channels at the same time...
+    * like when agent is waiting for a dev reply, user is replying with some more info, which can help in the investigation, how exactly you will use it
+* If the dev explains about the fix and asks to create a PR, do it
+* Do not accept any code related suggestions from bug reports channel, it is purely for the bug reporter and he should not influence in how you make the fix, he can provide more information about the issue and help you in debugging but any fix should be influenced by the developer
+* Sandbox mode
+* New workspace for each bug investigation, and clear the workspace on marking the bug as resolved
+* Programatically marking the bug as resolved / closed from api (should stop the running workflow if any)
+
+
+* add a button to summary
+    * take over -> 
+    * agent stops, updates bug status =>
+    * close
+    * on closure inform bug report:
+
+* file read and store
+* 
+
+
+1 Slack setup -> done
+2 Claude agent sdk support -> done
+3 Temporal setup -> done
+4 Read message from bug reports -> done
+5 ACK -> done
+6 DO initial investigation -> depends on 13
+7 If nothing is present -> ask user -> soorya
+8 Data modelling for storing conversations and key decisions and attachments -> soorya
+8 Act on follwup -> soorya
+9 Prepare investigation report and post to summary channel -> soorya
+10 Tag relevant oncall eng -> soorya
+11 Ask for followup if needed -> soorya
+13 Prepare PR or debug issue and propose a fix -> Allen
+    * MCP
+    * TOOL usage
+    * GIT mcp (repo cloning)
+    * Skills and system prompts
+    * repo mappings
+    * db mcp
+14 Take over mechanism -> 
+15 Inform both the parties on case closure -> soorya
+16 File handling -> soorya
+17 Nudging -> CP (sla_tracking.py)
+18 Admin panel -> CP
+    * list
+    * view
+    * Actions
+        * pre close
+        * update priority
+        * reassign oncall
+    * On call management
+        * team management
+19 Slack util api integrations based on need -> CP
+
+p10
+20 Observability() and eval (testing)
+
+
+
+claude --resume 70b82ba1-af9d-43f9-ad0f-cc75395d9097
+
+
+* Remove extra slack message on reply
+* Long running workflows
+* Multiple temporal workers
+* Duplicate bugs should be avoided:
+    * if there is an open bug with 80 similarity in the last 5 mins, link that thread and reply as duplicate
+* sandbox to the current cwd and not the entire filesystem
+* wait condition does not return anything
+* skills are not being picked
+* tools are not being called -> are being called
+* https://platform.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions for summary repo alone
+
+
+* Long running workflows
+* Multiple temporal workers
+
+
+* Duplicate bugs should be avoided:
+    * if there is an open bug with 80 similarity in the last 5 mins, link that thread and reply as duplicate
+    * Keep this configurable (env)
+* Should not grep or look for files outside the current working dir
+    * prepare allowlist for all tools and git commands and limited bash commands with in the cwd
+    * Basically should be able to do anything within that cwd
+* detailed logs on tool calls -> including args
+    * can this detailed agent logs be stored somewhere for further improvement of agent flow
+* 
+* Fix skills not being used or picked
+* add or update skills Programatically
+* remove report_finding tool call or make it to insert it to a table
+* And provide a link in the summary table to Dashboard which shows the entire agent thinking process and things it found as important and tool calls made
+
+* Check what happens if multiple bugs are posted at once
+* Check the SLA work flow
+
+
+
+
+
+
+claude --resume 9a9fab63-e2a7-4509-b71f-2c316b4d4a4c
+
+
+* Check the SLA work flow
+* Should not grep or look for files outside the current working dir
+    * prepare allowlist for all tools and git commands and limited bash commands with in the cwd
+    * Basically should be able to do anything within that cwd

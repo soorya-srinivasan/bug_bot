@@ -1,4 +1,18 @@
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class WorkflowState(str, Enum):
+    INVESTIGATING = "investigating"
+    AWAITING_REPORTER = "awaiting_reporter"
+    AWAITING_DEV = "awaiting_dev"
+
+
+@dataclass
+class IncomingMessage:
+    sender_type: str     # "reporter" | "developer"
+    sender_id: str       # Slack user ID
+    conversation_id: str # UUID string of the BugConversation row already persisted to DB
 
 
 @dataclass
@@ -8,6 +22,7 @@ class BugReportInput:
     thread_ts: str
     message_text: str
     reporter_user_id: str
+    attachments: list[dict] = field(default_factory=list)
 
 
 @dataclass
