@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     postgres_readonly_url: str = ""
     mysql_readonly_url: str = ""
 
+    # RAG
+    rag_embedding_model: str = "all-MiniLM-L6-v2"
+    rag_top_k: int = 5
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     anthropic_log: str = "info"

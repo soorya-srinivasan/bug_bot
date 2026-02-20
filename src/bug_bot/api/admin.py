@@ -1,11 +1,15 @@
 import asyncio
+import logging
 from datetime import datetime, date
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
 from bug_bot.oncall import service as oncall_service
+
+logger = logging.getLogger(__name__)
 from bug_bot.schemas.admin import (
     BugConversationListResponse,
     BugConversationResponse,
@@ -1153,4 +1157,89 @@ async def lookup_slack_users(
         pass
 
     return SlackUsersLookupResponse(users=results, team_id=team_id)
+
+
+# --- RAG Chat ---
+
+
+class ChatMessageItem(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_history: list[ChatMessageItem] = []
+
+
+class ChatSourceItem(BaseModel):
+    bug_id: str
+    source_type: str
+    chunk_text: str
+    similarity: float
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSourceItem]
+
+
+class RagIndexResponse(BaseModel):
+    status: str
+    total: int
+    indexed: dict
+
+
+class RagStatsResponse(BaseModel):
+    total_documents: int
+    by_type: dict
+    last_indexed_at: str | None
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest):
+    """RAG-powered chat endpoint — answers questions about bugs and investigations."""
+    from bug_bot.rag.chat import rag_chat
+
+    async with async_session() as session:
+        try:
+            history = [{"role": m.role, "content": m.content} for m in payload.conversation_history]
+            result = await rag_chat(session, payload.message, history)
+        except Exception as e:
+            logger.exception("RAG chat error")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Chat error: {e}",
+            )
+    return ChatResponse(
+        answer=result["answer"],
+        sources=[ChatSourceItem(**s) for s in result["sources"]],
+    )
+
+
+@router.post("/rag/index", response_model=RagIndexResponse)
+async def rag_reindex():
+    """Trigger a full re-index of all bugs, investigations, and findings."""
+    from bug_bot.rag.indexer import reindex_all
+
+    async with async_session() as session:
+        try:
+            result = await reindex_all(session)
+        except Exception as e:
+            logger.exception("RAG reindex error")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Reindex error: {e}",
+            )
+    return RagIndexResponse(status="completed", total=result["total"], indexed=result["indexed"])
+
+
+@router.get("/rag/stats", response_model=RagStatsResponse)
+async def rag_stats():
+    """Return RAG index statistics."""
+    from bug_bot.rag.vectorstore import get_stats
+
+    async with async_session() as session:
+        stats = await get_stats(session)
+    return RagStatsResponse(**stats)
 
