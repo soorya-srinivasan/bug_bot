@@ -164,4 +164,12 @@ This document describes the role and responsibility of each database table used 
 3. **On-call log history**
    - Query `oncall_history` by `team_id`, optionally filtering by `effective_date` or `created_at`, to get a full audit trail of who was assigned when and why.
 
+4. **Slack tagging (who gets @-mentioned)**
+   - When posting summaries or escalating, the bot tags in this order: **on-call engineer** → **service owner** → **Slack group**. Only one is chosen per team/entry.
+   - For the **person** (on-call engineer) to be tagged instead of only the group, at least one of these must be set in the DB:
+     - An **active row in `oncall_schedules`** for today (for that team), or
+     - **`teams.oncall_engineer`** (Slack user ID), or
+     - **`service_team_mapping.primary_oncall`** (Slack user ID) for that service.
+   - If all of these are missing for a team, the entry will have only `slack_group_id` and the bot will tag the **Slack group** only. Populate one of the above to get the engineer @-mentioned.
+
 This file focuses only on the tables and columns that are part of the on-call management system and their roles, responsibilities, and examples.

@@ -11,6 +11,22 @@ from bug_bot.slack.messages import (
 from bug_bot.temporal import InvestigationResult
 
 
+def _mention_for_entry(entry: dict) -> str | None:
+    """Pick one mention per entry: oncall_engineer > service_owner > slack_group_id.
+    Returns Slack mention string or None if nothing to tag.
+    """
+    oncall = entry.get("oncall_engineer")
+    if oncall and isinstance(oncall, str) and oncall.strip():
+        return f"<@{oncall.strip()}>"
+    owner = entry.get("service_owner")
+    if owner and isinstance(owner, str) and owner.strip():
+        return f"<@{owner.strip()}>"
+    group = entry.get("slack_group_id")
+    if group and isinstance(group, str) and group.strip():
+        return f"<!subteam^{group.strip()}>"
+    return None
+
+
 def _slack_configured() -> bool:
     return bool(settings.slack_bot_token) and not settings.slack_bot_token.startswith("xoxb-your")
 
@@ -34,7 +50,7 @@ class PostResultsInput:
     bug_id: str
     severity: str
     result: dict  # serialized InvestigationResult
-    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, slack_group_id}, ...]
+    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, service_owner, slack_group_id}; tag priority: oncall_engineer -> service_owner -> slack_group_id]
 
 
 @dataclass
@@ -45,7 +61,7 @@ class EscalationInput:
     severity: str
     relevant_services: list[str]
     escalation_level: int = 1
-    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, slack_group_id}, ...]
+    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, service_owner, slack_group_id}; tag priority: oncall_engineer -> service_owner -> slack_group_id]
 
 
 @activity.defn
@@ -109,13 +125,16 @@ async def create_summary_thread(input: PostResultsInput) -> str:
     )
     detail_blocks = format_investigation_result(input.result, input.bug_id)
 
-    # Build on-call mention blocks/text so on-call engineers get notified in #bug-summaries.
+    # Build mention blocks: oncall_engineer > service_owner > slack_group_id (one per entry).
     parts: list[str] = []
-    for entry in input.oncall_entries:
-        if entry.get("slack_group_id"):
-            parts.append(f"<!subteam^{entry['slack_group_id']}>")
-        elif entry.get("oncall_engineer"):
-            parts.append(f"<@{entry['oncall_engineer']}>")
+    for i, entry in enumerate(input.oncall_entries):
+        mention = _mention_for_entry(entry)
+        activity.logger.info(
+            f"On-call entry {i}: oncall_engineer={entry.get('oncall_engineer')!r} "
+            f"service_owner={entry.get('service_owner')!r} slack_group_id={entry.get('slack_group_id')!r} -> mention={mention!r}"
+        )
+        if mention:
+            parts.append(mention)
 
     fallback_text = f"Bug investigation results: {input.bug_id}"
     mention_blocks: list[dict] = []
@@ -205,12 +224,16 @@ async def escalate_to_humans(input: EscalationInput) -> None:
         f"Requires human investigation."
     )
 
+    # Tag oncall_engineer > service_owner > slack_group_id (one per entry).
     parts = []
-    for entry in input.oncall_entries:
-        if entry.get("slack_group_id"):
-            parts.append(f"<!subteam^{entry['slack_group_id']}>")
-        elif entry.get("oncall_engineer"):
-            parts.append(f"<@{entry['oncall_engineer']}>")
+    for i, entry in enumerate(input.oncall_entries):
+        mention = _mention_for_entry(entry)
+        activity.logger.info(
+            f"On-call entry {i}: oncall_engineer={entry.get('oncall_engineer')!r} "
+            f"service_owner={entry.get('service_owner')!r} slack_group_id={entry.get('slack_group_id')!r} -> mention={mention!r}"
+        )
+        if mention:
+            parts.append(mention)
     mention_str = " ".join(parts)
 
     text = f":rotating_light: *{msg}*"

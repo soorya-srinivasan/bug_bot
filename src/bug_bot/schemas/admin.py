@@ -28,6 +28,12 @@ class InvestigationSummary(BaseModel):
     confidence: float | None = None
 
 
+class TaggedOnEntry(BaseModel):
+    oncall_engineer: str | None = None
+    service_owner: str | None = None
+    slack_group_id: str | None = None
+
+
 class BugListItem(BaseModel):
     id: str
     bug_id: str
@@ -42,6 +48,7 @@ class BugListItem(BaseModel):
     updated_at: datetime
     resolved_at: datetime | None = None
     investigation_summary: InvestigationSummary | None = None
+    tagged_on: list[TaggedOnEntry] = []
 
 
 class PaginatedBugs(BaseModel):
@@ -175,8 +182,8 @@ class TeamSummary(BaseModel):
 class ServiceTeamMappingBase(BaseModel):
     service_name: str
     github_repo: str
-    team_slack_group: str | None = None
-    primary_oncall: str | None = None
+    team_slack_group: str
+    primary_oncall: str
     tech_stack: str
     service_owner: str | None = None
     team_id: str | None = None
@@ -258,6 +265,13 @@ class SlackUserGroupUsersResponse(BaseModel):
     users: list[SlackUserDetail] | None = None
 
 
+class SlackUsersLookupResponse(BaseModel):
+    """Batch user lookup result keyed by Slack user ID."""
+
+    users: dict[str, SlackUserDetail]
+    team_id: str | None = None
+
+
 # --- On-Call Scheduling ---
 
 
@@ -320,4 +334,36 @@ class CurrentOnCallResponse(BaseModel):
     effective_date: date | None
     source: Literal["schedule", "rotation", "manual"] | None
     schedule_id: str | None = None
+
+
+# --- Bug Conversations & Findings ---
+
+
+class BugConversationResponse(BaseModel):
+    id: str
+    bug_id: str
+    channel: str | None = None
+    sender_type: str
+    sender_id: str | None = None
+    message_text: str | None = None
+    message_type: str
+    metadata: dict | None = None
+    created_at: datetime
+
+
+class BugConversationListResponse(BaseModel):
+    items: list[BugConversationResponse]
+
+
+class InvestigationFindingResponse(BaseModel):
+    id: str
+    bug_id: str
+    category: str
+    finding: str
+    severity: str
+    created_at: datetime
+
+
+class InvestigationFindingListResponse(BaseModel):
+    items: list[InvestigationFindingResponse]
 

@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from bug_bot.config import settings
@@ -43,6 +44,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Bug Bot", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8001", "http://localhost:8081"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(admin_api.router, prefix="/api/admin", tags=["admin"])
 app.include_router(api_router)
 
