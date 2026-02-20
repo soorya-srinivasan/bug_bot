@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from temporalio import activity
 
@@ -93,7 +93,7 @@ async def log_conversation_event(
 @activity.defn
 async def find_stale_bugs(inactivity_days: int) -> list[dict]:
     """Return open bugs with no human interaction in the last inactivity_days days."""
-    threshold = datetime.utcnow() - timedelta(days=inactivity_days)
+    threshold = datetime.now(timezone.utc) - timedelta(days=inactivity_days)
     async with async_session() as session:
         bugs = await BugRepository(session).get_stale_open_bugs(threshold)
     activity.logger.info(f"Found {len(bugs)} stale bugs (threshold={threshold.date()})")

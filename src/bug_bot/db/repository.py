@@ -1,6 +1,6 @@
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 
-from sqlalchemy import Select, desc, func, select, update, and_, or_
+from sqlalchemy import Select, cast, desc, func, select, text, update, and_, or_, Date
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -48,7 +48,7 @@ class BugRepository:
         stmt = (
             update(BugReport)
             .where(BugReport.bug_id == bug_id)
-            .values(assignee_user_id=user_id, updated_at=datetime.utcnow())
+            .values(assignee_user_id=user_id, updated_at=datetime.now(timezone.utc))
         )
         await self.session.execute(stmt)
         await self.session.commit()
@@ -57,10 +57,10 @@ class BugRepository:
         stmt = (
             update(BugReport)
             .where(BugReport.bug_id == bug_id)
-            .values(status=status, updated_at=datetime.utcnow())
+            .values(status=status, updated_at=datetime.now(timezone.utc))
         )
         if status == "resolved":
-            stmt = stmt.values(resolved_at=datetime.utcnow())
+            stmt = stmt.values(resolved_at=datetime.now(timezone.utc))
         await self.session.execute(stmt)
         await self.session.commit()
 
@@ -131,13 +131,13 @@ class BugRepository:
         severity: str | None = None,
         status: str | None = None,
     ) -> BugReport | None:
-        values: dict = {"updated_at": datetime.utcnow()}
+        values: dict = {"updated_at": datetime.now(timezone.utc)}
         if severity is not None:
             values["severity"] = severity
         if status is not None:
             values["status"] = status
             if status == "resolved":
-                values["resolved_at"] = datetime.utcnow()
+                values["resolved_at"] = datetime.now(timezone.utc)
 
         if len(values) == 1:  # only updated_at
             return await self.get_bug_by_id(bug_id)
@@ -207,7 +207,7 @@ class BugRepository:
         stmt = (
             update(SLAConfig)
             .where(SLAConfig.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(SLAConfig)
         )
         result = await self.session.execute(stmt)
@@ -218,7 +218,7 @@ class BugRepository:
         stmt = (
             update(SLAConfig)
             .where(SLAConfig.id == id_)  # type: ignore[arg-type]
-            .values(is_active=False, updated_at=datetime.utcnow())
+            .values(is_active=False, updated_at=datetime.now(timezone.utc))
         )
         await self.session.execute(stmt)
         await self.session.commit()
@@ -336,7 +336,7 @@ class BugRepository:
         stmt = (
             update(Team)
             .where(Team.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(Team)
         )
         result = await self.session.execute(stmt)
@@ -695,7 +695,7 @@ class BugRepository:
         stmt = (
             update(OnCallSchedule)
             .where(OnCallSchedule.id == id_)  # type: ignore[arg-type]
-            .values(**data, updated_at=datetime.utcnow())
+            .values(**data, updated_at=datetime.now(timezone.utc))
             .returning(OnCallSchedule)
         )
         result = await self.session.execute(stmt)
@@ -796,3 +796,189 @@ class BugRepository:
             return team.rotation_order[next_idx]
 
         return None
+
+    # ── Dashboard Analytics ──────────────────────────────────────────────────
+
+    async def get_dashboard_stats(self) -> dict:
+        # Total / open / resolved counts
+        total_q = await self.session.execute(
+            select(func.count()).select_from(BugReport)
+        )
+        total_bugs = int(total_q.scalar_one())
+
+        resolved_q = await self.session.execute(
+            select(func.count()).select_from(BugReport).where(BugReport.status == "resolved")
+        )
+        resolved_bugs = int(resolved_q.scalar_one())
+        open_bugs = total_bugs - resolved_bugs
+
+        # Average resolution time (hours) for resolved bugs.
+        # Uses abs() to handle clock skew between DB server_default now() and Python utcnow.
+        avg_res_q = await self.session.execute(
+            select(
+                func.avg(
+                    func.abs(func.extract("epoch", BugReport.resolved_at - BugReport.created_at)) / 3600
+                )
+            ).where(BugReport.resolved_at.is_not(None))
+        )
+        avg_resolution_hours = avg_res_q.scalar_one()
+        if avg_resolution_hours is not None:
+            avg_resolution_hours = round(float(avg_resolution_hours), 2)
+
+        # Escalation rate
+        esc_q = await self.session.execute(
+            select(func.count(func.distinct(Escalation.bug_id))).select_from(Escalation)
+        )
+        escalated_count = int(esc_q.scalar_one())
+        escalation_rate = round((escalated_count / total_bugs * 100) if total_bugs else 0.0, 1)
+
+        # Investigation aggregate metrics
+        inv_agg_q = await self.session.execute(
+            select(
+                func.avg(Investigation.confidence),
+                func.coalesce(func.sum(Investigation.cost_usd), 0.0),
+                func.avg(Investigation.duration_ms),
+            ).select_from(Investigation)
+        )
+        inv_row = inv_agg_q.one()
+        avg_confidence = round(float(inv_row[0]), 2) if inv_row[0] is not None else None
+        total_cost = round(float(inv_row[1]), 2)
+        avg_duration = round(float(inv_row[2]), 0) if inv_row[2] is not None else None
+
+        # Bugs by status
+        status_q = await self.session.execute(
+            select(BugReport.status, func.count())
+            .group_by(BugReport.status)
+            .order_by(func.count().desc())
+        )
+        bugs_by_status = [{"status": r[0], "count": r[1]} for r in status_q.all()]
+
+        # Bugs by severity
+        sev_q = await self.session.execute(
+            select(BugReport.severity, func.count())
+            .group_by(BugReport.severity)
+            .order_by(BugReport.severity)
+        )
+        bugs_by_severity = [{"severity": r[0], "count": r[1]} for r in sev_q.all()]
+
+        # Bug trend (last 30 days)
+        since = datetime.now(timezone.utc) - timedelta(days=30)
+        created_q = await self.session.execute(
+            select(
+                cast(BugReport.created_at, Date).label("d"),
+                func.count(),
+            )
+            .where(BugReport.created_at >= since)
+            .group_by("d")
+            .order_by("d")
+        )
+        created_map: dict[date, int] = {r[0]: r[1] for r in created_q.all()}
+
+        resolved_trend_q = await self.session.execute(
+            select(
+                cast(BugReport.resolved_at, Date).label("d"),
+                func.count(),
+            )
+            .where(BugReport.resolved_at >= since)
+            .group_by("d")
+            .order_by("d")
+        )
+        resolved_map: dict[date, int] = {r[0]: r[1] for r in resolved_trend_q.all()}
+
+        all_dates = sorted(set(created_map.keys()) | set(resolved_map.keys()))
+        bug_trend = [
+            {
+                "date": d.isoformat(),
+                "created": created_map.get(d, 0),
+                "resolved": resolved_map.get(d, 0),
+            }
+            for d in all_dates
+        ]
+
+        # Average resolution by severity
+        avg_sev_q = await self.session.execute(
+            select(
+                BugReport.severity,
+                func.avg(
+                    func.abs(func.extract("epoch", BugReport.resolved_at - BugReport.created_at)) / 3600
+                ),
+            )
+            .where(BugReport.resolved_at.is_not(None))
+            .group_by(BugReport.severity)
+            .order_by(BugReport.severity)
+        )
+        avg_resolution_by_severity = [
+            {"severity": r[0], "avg_hours": round(float(r[1]), 2)}
+            for r in avg_sev_q.all()
+        ]
+
+        # Fix type distribution
+        fix_q = await self.session.execute(
+            select(Investigation.fix_type, func.count())
+            .group_by(Investigation.fix_type)
+            .order_by(func.count().desc())
+        )
+        fix_type_distribution = [{"fix_type": r[0], "count": r[1]} for r in fix_q.all()]
+
+        # Top affected services (unnest JSONB array)
+        svc_q = await self.session.execute(
+            text(
+                "SELECT svc, COUNT(*) as cnt "
+                "FROM investigations, jsonb_array_elements_text(relevant_services) AS svc "
+                "GROUP BY svc ORDER BY cnt DESC LIMIT 10"
+            )
+        )
+        top_services = [{"service": r[0], "count": r[1]} for r in svc_q.all()]
+
+        # Findings by category
+        cat_q = await self.session.execute(
+            select(InvestigationFinding.category, func.count())
+            .group_by(InvestigationFinding.category)
+            .order_by(func.count().desc())
+        )
+        findings_by_category = [{"category": r[0], "count": r[1]} for r in cat_q.all()]
+
+        # Findings by severity
+        fsev_q = await self.session.execute(
+            select(InvestigationFinding.severity, func.count())
+            .group_by(InvestigationFinding.severity)
+            .order_by(func.count().desc())
+        )
+        findings_by_severity = [{"severity": r[0], "count": r[1]} for r in fsev_q.all()]
+
+        # Recent bugs (last 10)
+        recent_q = await self.session.execute(
+            select(BugReport)
+            .order_by(BugReport.created_at.desc())
+            .limit(10)
+        )
+        recent_bugs = [
+            {
+                "bug_id": b.bug_id,
+                "severity": b.severity,
+                "status": b.status,
+                "original_message": b.original_message[:120],
+                "created_at": b.created_at.isoformat(),
+            }
+            for b in recent_q.scalars().all()
+        ]
+
+        return {
+            "total_bugs": total_bugs,
+            "open_bugs": open_bugs,
+            "resolved_bugs": resolved_bugs,
+            "avg_resolution_hours": avg_resolution_hours,
+            "escalation_rate": escalation_rate,
+            "avg_confidence": avg_confidence,
+            "total_investigation_cost_usd": total_cost,
+            "avg_investigation_duration_ms": avg_duration,
+            "bugs_by_status": bugs_by_status,
+            "bugs_by_severity": bugs_by_severity,
+            "bug_trend": bug_trend,
+            "avg_resolution_by_severity": avg_resolution_by_severity,
+            "fix_type_distribution": fix_type_distribution,
+            "top_services": top_services,
+            "findings_by_category": findings_by_category,
+            "findings_by_severity": findings_by_severity,
+            "recent_bugs": recent_bugs,
+        }
