@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     # "canvas"   – brief header message, then a Markdown file uploaded into the thread.
     summary_post_mode: str = "threaded"
 
+    # Reporter reply rate limiting
+    # Max replies a reporter may submit within reporter_reply_rate_window_secs before
+    # the message is silently dropped and a "please wait" reply is returned.
+    reporter_reply_rate_limit: int = 3
+    reporter_reply_rate_window_secs: int = 300  # 5 minutes
+
+    # Duplicate detection
+    # When True, new top-level bug reports are checked against recent open bugs.
+    enable_duplicate_detection: bool = False
+    # How far back to search for potential duplicates.
+    duplicate_check_window_hours: int = 2
+    # Minimum Claude-assessed similarity (0.0–1.0) to treat a report as duplicate.
+    duplicate_similarity_threshold: float = 0.8
+
     # Database
     database_url: str = "postgresql+asyncpg://bugbot:bugbot@localhost:5432/bugbot"
 

@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import datetime, timedelta
 
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
@@ -7,6 +8,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 from bug_bot.config import settings
 from bug_bot.db.session import async_session
 from bug_bot.db.repository import BugRepository
+from bug_bot.duplicate import check_duplicate_bug
 from bug_bot.slack.messages import format_triage_response
 from bug_bot.temporal.client import get_temporal_client
 from bug_bot.temporal import BugReportInput
@@ -162,6 +164,36 @@ def register_handlers(app: AsyncApp):
 
         # Run triage classification
         triage = await triage_bug_report(text, reporter)
+
+        # ── Duplicate detection (feature flag) ────────────────────────────────
+        if settings.enable_duplicate_detection:
+            dup_since = datetime.utcnow() - timedelta(hours=settings.duplicate_check_window_hours)
+            async with async_session() as _s:
+                recent_bugs = await BugRepository(_s).get_recent_open_bugs(since=dup_since)
+            candidates = [
+                {"bug_id": b.bug_id, "message": b.original_message}
+                for b in recent_bugs
+            ]
+            dup = await check_duplicate_bug(text, triage.get("summary", ""), candidates)
+            if dup and dup["confidence"] >= settings.duplicate_similarity_threshold:
+                dup_bug_id = dup["bug_id"]
+                async with async_session() as _s:
+                    orig = await BugRepository(_s).get_bug_by_id(dup_bug_id)
+                thread_link = (
+                    f"slack://channel?team=&id={orig.slack_channel_id}&thread_ts={orig.slack_thread_ts}"
+                    if orig else ""
+                )
+                await client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=(
+                        f":warning: This report looks similar to an existing open bug: *{dup_bug_id}*.\n"
+                        f"Please add your information to that thread"
+                        + (f": <{thread_link}|view thread>" if thread_link else ".")
+                        + "\nIf your issue is genuinely different, re-post with more specific details."
+                    ),
+                )
+                return  # Do NOT insert to DB or start workflow
         severity = triage.get("severity", "P3")
 
         # Acknowledge with triage info
@@ -264,6 +296,8 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
     channel_id = event["channel"]
     thread_ts = event["thread_ts"]
     text = event.get("text", "")
+    print("EVENT THREADDDD")
+    print(event)
     if event.get("blocks"):
         block_text = _extract_text_from_blocks(event["blocks"])
         if block_text and block_text not in text:
@@ -285,6 +319,23 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
         return
 
     if not bug.temporal_workflow_id or bug.status in ("resolved", "escalated"):
+        return
+
+    # ── Rate limiting ─────────────────────────────────────────────────────────
+    rate_window_start = datetime.utcnow() - timedelta(seconds=settings.reporter_reply_rate_window_secs)
+    async with async_session() as _s:
+        recent_count = await BugRepository(_s).count_recent_reporter_replies(
+            bug.bug_id, since=rate_window_start
+        )
+    if recent_count >= settings.reporter_reply_rate_limit:
+        await client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=(
+                ":hourglass: We've received your previous messages and the investigation "
+                "is catching up. Please wait a moment before sending more updates."
+            ),
+        )
         return
 
     temporal = await get_temporal_client()
