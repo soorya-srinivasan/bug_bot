@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, NonNegativeInt
 
 
 Severity = Literal["P1", "P2", "P3", "P4"]
-Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved"]
+Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved", "dev_takeover"]
 
 
 class PaginationParams(BaseModel):
@@ -47,6 +47,7 @@ class BugListItem(BaseModel):
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None = None
+    assignee_user_id: str | None = None
     investigation_summary: InvestigationSummary | None = None
     tagged_on: list[TaggedOnEntry] = []
 

@@ -187,6 +187,7 @@ async def list_bugs(
                 created_at=bug.created_at,
                 updated_at=bug.updated_at,
                 resolved_at=bug.resolved_at,
+                assignee_user_id=bug.assignee_user_id,
                 investigation_summary=investigation_summary,
                 tagged_on=tagged_on,
             )
@@ -223,6 +224,7 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         created_at=bug.created_at,
         updated_at=bug.updated_at,
         resolved_at=bug.resolved_at,
+        assignee_user_id=bug.assignee_user_id,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
     )
@@ -269,6 +271,7 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         created_at=updated.created_at,
         updated_at=updated.updated_at,
         resolved_at=updated.resolved_at,
+        assignee_user_id=updated.assignee_user_id,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
     )
