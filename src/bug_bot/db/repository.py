@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import Select, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bug_bot.models.models import BugReport, BugConversation, Investigation, SLAConfig, Escalation, ServiceTeamMapping
+from bug_bot.models.models import BugReport, BugConversation, Investigation, SLAConfig, Escalation, ServiceTeamMapping, InvestigationFinding
 
 
 class BugRepository:
@@ -366,3 +366,52 @@ class BugRepository:
         self.session.add(entry)
         await self.session.commit()
         return entry
+
+    async def save_finding(
+        self,
+        bug_id: str,
+        category: str,
+        finding: str,
+        severity: str,
+    ) -> InvestigationFinding:
+        entry = InvestigationFinding(
+            bug_id=bug_id, category=category, finding=finding, severity=severity
+        )
+        self.session.add(entry)
+        await self.session.commit()
+        return entry
+
+    async def get_findings_for_bug(self, bug_id: str) -> list[InvestigationFinding]:
+        stmt = (
+            select(InvestigationFinding)
+            .where(InvestigationFinding.bug_id == bug_id)
+            .order_by(InvestigationFinding.created_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def count_recent_reporter_replies(self, bug_id: str, since: datetime) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(BugConversation)
+            .where(
+                BugConversation.bug_id == bug_id,
+                BugConversation.sender_type == "reporter",
+                BugConversation.message_type == "reporter_reply",
+                BugConversation.created_at >= since,
+            )
+        )
+        result = await self.session.execute(stmt)
+        return int(result.scalar_one())
+
+    async def get_recent_open_bugs(self, since: datetime) -> list[BugReport]:
+        stmt = (
+            select(BugReport)
+            .where(
+                BugReport.created_at >= since,
+                BugReport.status.not_in(["resolved"]),
+            )
+            .order_by(BugReport.created_at.desc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
