@@ -22,7 +22,13 @@ def build_continuation_prompt(bug_id: str, conversation_ids: list[str], state: s
     elif state == "awaiting_dev":
         instruction += (
             " If a developer message asks for a fix or PR, proceed with creating it. "
-            "If the developer asks to close or resolve this bug, set action='resolved'."
+            "Set action='resolved' ONLY when the developer explicitly asks to close or resolve this bug "
+            "(e.g. 'please close this', 'mark it as resolved', 'close the bug'). "
+            "In ALL other cases — including when they say the bug is fixed, it's not a real issue, "
+            "they'll handle it themselves, or any other statement — reply with a follow-up question "
+            "asking whether the bug should be closed: post a clarification message and set action='escalate' "
+            "so the workflow keeps waiting. "
+            "Never infer closure intent. Require an explicit close instruction."
         )
     return f"{recent}\n\n{instruction}"
 
