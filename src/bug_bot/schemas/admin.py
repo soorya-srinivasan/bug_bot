@@ -151,3 +151,52 @@ class PaginatedServiceTeamMappings(BaseModel):
     page: int
     page_size: int
 
+
+# --- Slack user groups (admin) ---
+
+
+class SlackUserGroupListItem(BaseModel):
+    """A Slack user group (mention group) summary."""
+
+    id: str
+    name: str
+    handle: str
+    description: str | None = None
+    user_count: int | None = None
+    date_create: int | None = None
+
+
+class SlackUserGroupListResponse(BaseModel):
+    items: list[SlackUserGroupListItem]
+
+
+class SlackUserGroupUsersRequest(BaseModel):
+    """Request body to list users in a Slack user group."""
+
+    usergroup_id: str = Field(..., description="Slack user group ID (e.g. S01234567)")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"usergroup_id": "S01234567"}],
+        },
+    }
+
+
+class SlackUserDetail(BaseModel):
+    """Slack user info when include_user_details=true."""
+
+    id: str
+    name: str | None = None
+    real_name: str | None = None
+    display_name: str | None = None
+    is_bot: bool = False
+    deleted: bool = False
+
+
+class SlackUserGroupUsersResponse(BaseModel):
+    """Users in a Slack user group."""
+
+    usergroup_id: str
+    user_ids: list[str]
+    users: list[SlackUserDetail] | None = None
+

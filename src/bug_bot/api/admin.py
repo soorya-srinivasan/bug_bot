@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
@@ -20,7 +20,13 @@ from bug_bot.schemas.admin import (
     ServiceTeamMappingCreate,
     ServiceTeamMappingResponse,
     ServiceTeamMappingUpdate,
+    SlackUserDetail,
+    SlackUserGroupListItem,
+    SlackUserGroupListResponse,
+    SlackUserGroupUsersRequest,
+    SlackUserGroupUsersResponse,
 )
+from bug_bot.slack.user_groups import list_user_groups, list_users_in_group
 
 
 router = APIRouter()
@@ -433,4 +439,81 @@ async def update_service_team_mapping(
 async def delete_service_team_mapping(id: str, repo: BugRepository = Depends(get_repo)):
     await repo.delete_service_mapping(id)
     return None
+
+
+# --- Slack user groups (admin) ---
+
+
+@router.get("/slack/user-groups", response_model=SlackUserGroupListResponse)
+async def get_slack_user_groups(
+    include_disabled: bool = Query(False, description="Include disabled user groups"),
+):
+    """List Slack user groups (mention groups) in the workspace."""
+    try:
+        raw = await list_user_groups(include_disabled=include_disabled)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Slack API error: {e!s}",
+        ) from e
+    items = [
+        SlackUserGroupListItem(
+            id=g["id"],
+            name=g.get("name", ""),
+            handle=g.get("handle", ""),
+            description=g.get("description") or None,
+            user_count=g.get("user_count"),
+            date_create=g.get("date_create"),
+        )
+        for g in raw
+    ]
+    return SlackUserGroupListResponse(items=items)
+
+
+@router.post(
+    "/slack/user-groups/users",
+    response_model=SlackUserGroupUsersResponse,
+)
+async def get_slack_user_group_users(
+    payload: SlackUserGroupUsersRequest = Body(
+        ...,
+        example={"usergroup_id": "S01234567"},
+        description="Request body containing the Slack user group ID.",
+    ),
+    include_disabled: bool = Query(False, description="Include disabled user groups"),
+    include_user_details: bool = Query(
+        True,
+        description="Fetch real_name, display_name, etc. for each user",
+    ),
+):
+    """List users in a Slack user group. Group ID is provided in the request body."""
+    try:
+        raw = await list_users_in_group(
+            payload.usergroup_id,
+            include_disabled=include_disabled,
+            include_user_details=include_user_details,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Slack API error: {e!s}",
+        ) from e
+    users = None
+    if raw.get("users") is not None:
+        users = [
+            SlackUserDetail(
+                id=u["id"],
+                name=u.get("name"),
+                real_name=u.get("real_name"),
+                display_name=u.get("display_name"),
+                is_bot=u.get("is_bot", False),
+                deleted=u.get("deleted", False),
+            )
+            for u in raw["users"]
+        ]
+    return SlackUserGroupUsersResponse(
+        usergroup_id=raw["usergroup_id"],
+        user_ids=raw["user_ids"],
+        users=users,
+    )
 
