@@ -19,16 +19,9 @@ def build_mcp_servers() -> dict:
     #     "args": ["-y", "@anthropic-ai/mcp-server-git"],
     # }
 
-    # # Grafana — API key is optional (works with anonymous admin access)
-    # if settings.grafana_url:
-    #     grafana_env = {"GRAFANA_URL": settings.grafana_url}
-    #     if settings.grafana_api_key:
-    #         grafana_env["GRAFANA_API_KEY"] = settings.grafana_api_key
-    #     servers["grafana"] = {
-    #         "command": "npx",
-    #         "args": ["-y", "@grafana/mcp-grafana"],
-    #         "env": grafana_env,
-    #     }
+    # Grafana MCP via npx is disabled — @grafana/mcp-grafana does not exist on npm.
+    # Loki and Grafana are queried directly via the bugbot_tools custom MCP server
+    # (query_loki_logs and list_datasources tools in tools.py).
 
     # # New Relic
     # if settings.newrelic_api_key:

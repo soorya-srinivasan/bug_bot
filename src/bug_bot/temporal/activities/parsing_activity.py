@@ -4,9 +4,8 @@ from temporalio import activity
 
 from bug_bot.temporal import BugReportInput, ParsedBug
 
-# Keyword -> service mapping (extend with your actual services)
-SERVICE_KEYWORDS = {
-    "payment-service": "payment-service",  # sample app demo service
+# Fallback keyword -> service mapping used only when AI matching fails or returns empty
+_FALLBACK_KEYWORDS = {
     "payment": "Payment.API",
     "bill": "Bill.API",
     "invoice": "Bill.API",
@@ -40,11 +39,19 @@ async def parse_bug_report(input: BugReportInput) -> ParsedBug:
             severity = sev
             break
 
-    # Detect relevant services
+    # AI-powered service detection
     services = []
-    for keyword, service in SERVICE_KEYWORDS.items():
-        if keyword in text_lower and service not in services:
-            services.append(service)
+    try:
+        from bug_bot.service_matcher import match_services
+        services = await match_services(input.message_text)
+    except Exception as e:
+        activity.logger.warning(f"AI service matching failed for {input.bug_id}: {e}")
+
+    # Fall back to keyword matching if AI returned nothing
+    if not services:
+        for keyword, service in _FALLBACK_KEYWORDS.items():
+            if keyword in text_lower and service not in services:
+                services.append(service)
 
     # Extract keywords (simple approach)
     keywords = re.findall(r"\b(?:error|exception|timeout|500|404|null|crash|slow|fail)\b", text_lower)

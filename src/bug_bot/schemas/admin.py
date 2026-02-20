@@ -185,6 +185,7 @@ class ServiceTeamMappingBase(BaseModel):
     team_slack_group: str
     primary_oncall: str
     tech_stack: str
+    description: str | None = None
     service_owner: str | None = None
     team_id: str | None = None
 
@@ -199,6 +200,7 @@ class ServiceTeamMappingUpdate(BaseModel):
     team_slack_group: str | None = None
     primary_oncall: str | None = None
     tech_stack: str | None = None
+    description: str | None = None
     service_owner: str | None = None
     team_id: str | None = None
 

@@ -9,12 +9,12 @@ from bug_bot.config import settings
 
 logger = logging.getLogger(__name__)
 
-TRIAGE_SYSTEM_PROMPT = """\
+_TRIAGE_SYSTEM_PROMPT_TEMPLATE = """\
 You are Bug Bot's triage classifier for ShopTech.
 Given a bug report from Slack, respond with a JSON object (no markdown fences) containing:
 - severity: P1 | P2 | P3 | P4
 - category: one of [api_error, ui_bug, data_issue, performance, security, infrastructure, unknown]
-- affected_services: list of likely service names (from: Payment, Bill, Inventory, Auth, Subscription, Company, AFT, audit)
+- affected_services: list of canonical service_name values from the registry below that are likely affected
 - summary: one-sentence plain-English summary of the bug
 - needs_investigation: boolean, true unless the report is clearly spam/noise
 
@@ -23,6 +23,9 @@ Severity guide:
   P2 - Major feature broken for many users
   P3 - Bug with workaround available
   P4 - Cosmetic / minor issue
+
+[SERVICE REGISTRY]
+{service_registry}
 """
 
 
@@ -45,11 +48,20 @@ async def triage_bug_report(message_text: str, reporter_user_id: str) -> dict:
         return defaults
 
     try:
+        from bug_bot.service_matcher import _fetch_all_services, _format_service_list
+        services = await _fetch_all_services()
+        service_registry = _format_service_list(services) if services else "No services registered."
+        system_prompt = _TRIAGE_SYSTEM_PROMPT_TEMPLATE.format(service_registry=service_registry)
+    except Exception:
+        logger.exception("Failed to load service registry for triage; using empty list.")
+        system_prompt = _TRIAGE_SYSTEM_PROMPT_TEMPLATE.format(service_registry="No services registered.")
+
+    try:
         client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         response = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
-            system=TRIAGE_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[
                 {
                     "role": "user",
