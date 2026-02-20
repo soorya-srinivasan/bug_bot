@@ -190,9 +190,9 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                     SELECT
                         s.service_name, s.github_repo, s.tech_stack,
                         s.team_slack_group, s.service_owner, s.primary_oncall,
-                        g.slack_group_id, g.oncall_engineer AS group_oncall
+                        t.slack_group_id, t.oncall_engineer AS team_oncall
                     FROM service_team_mapping s
-                    LEFT JOIN service_groups g ON s.group_id = g.id
+                    LEFT JOIN teams t ON s.team_id = t.id
                     WHERE lower(s.service_name) = lower(%s)
                     LIMIT 1;
                     """,
@@ -206,8 +206,8 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                     f"GitHub repo: {row['github_repo']}\n"
                     f"Tech stack: {row['tech_stack']}\n"
                     f"Service owner: {row['service_owner'] or row['primary_oncall'] or 'N/A'}\n"
-                    f"Group Slack group: {row['slack_group_id'] or row['team_slack_group'] or 'N/A'}\n"
-                    f"Group on-call: {row['group_oncall'] or 'N/A'}"
+                    f"Team Slack group: {row['slack_group_id'] or row['team_slack_group'] or 'N/A'}\n"
+                    f"Team on-call: {row['team_oncall'] or 'N/A'}"
                 )
     except Exception as e:
         return f"Error querying service mapping: {e}"

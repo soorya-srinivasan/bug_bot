@@ -1,27 +1,36 @@
-from datetime import datetime
+from datetime import datetime, date
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 
 from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
+from bug_bot.oncall import service as oncall_service
 from bug_bot.schemas.admin import (
     BugFilters,
     BugListItem,
     BugUpdate,
+    CurrentOnCallResponse,
     EscalationCreate,
     EscalationResponse,
     InvestigationResponse,
+    OnCallHistoryResponse,
+    OnCallScheduleCreate,
+    OnCallScheduleResponse,
+    OnCallScheduleUpdate,
     PaginatedBugs,
-    PaginatedServiceGroups,
+    PaginatedOnCallHistory,
+    PaginatedOnCallSchedules,
+    PaginatedTeams,
     PaginatedServiceTeamMappings,
     SLAConfigCreate,
     SLAConfigListResponse,
     SLAConfigResponse,
     SLAConfigUpdate,
-    ServiceGroupCreate,
-    ServiceGroupResponse,
-    ServiceGroupSummary,
-    ServiceGroupUpdate,
+    TeamCreate,
+    TeamResponse,
+    TeamRotationConfigUpdate,
+    TeamSummary,
+    TeamUpdate,
     ServiceTeamMappingCreate,
     ServiceTeamMappingResponse,
     ServiceTeamMappingUpdate,
@@ -364,7 +373,7 @@ async def list_service_team_mappings(
             primary_oncall=m.primary_oncall,
             tech_stack=m.tech_stack,
             service_owner=m.service_owner,
-            group_id=str(m.group_id) if m.group_id else None,
+            team_id=str(m.team_id) if m.team_id else None,
             created_at=m.created_at,
         )
         for m in items
@@ -378,12 +387,12 @@ async def list_service_team_mappings(
 
 
 def _mapping_response(m) -> ServiceTeamMappingResponse:
-    group_summary = None
-    if m.group is not None:
-        group_summary = ServiceGroupSummary(
-            id=str(m.group.id),
-            slack_group_id=m.group.slack_group_id,
-            oncall_engineer=m.group.oncall_engineer,
+    team_summary = None
+    if m.team is not None:
+        team_summary = TeamSummary(
+            id=str(m.team.id),
+            slack_group_id=m.team.slack_group_id,
+            oncall_engineer=m.team.oncall_engineer,
         )
     return ServiceTeamMappingResponse(
         id=str(m.id),
@@ -393,9 +402,9 @@ def _mapping_response(m) -> ServiceTeamMappingResponse:
         primary_oncall=m.primary_oncall,
         tech_stack=m.tech_stack,
         service_owner=m.service_owner,
-        group_id=str(m.group_id) if m.group_id else None,
+        team_id=str(m.team_id) if m.team_id else None,
         created_at=m.created_at,
-        group=group_summary,
+        team=team_summary,
     )
 
 
@@ -421,7 +430,7 @@ async def create_service_team_mapping(
 ):
     data = payload.model_dump()
     m = await repo.create_service_mapping(data)
-    # Reload to get the eager-loaded group relationship
+    # Reload to get the eager-loaded team relationship
     m = await repo.get_service_mapping_by_id(str(m.id))
     return _mapping_response(m)
 
@@ -439,7 +448,7 @@ async def update_service_team_mapping(
     m = await repo.update_service_mapping(id, data)
     if m is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mapping not found")
-    # Reload to get the eager-loaded group relationship
+    # Reload to get the eager-loaded team relationship
     m = await repo.get_service_mapping_by_id(str(m.id))
     return _mapping_response(m)
 
@@ -450,83 +459,458 @@ async def delete_service_team_mapping(id: str, repo: BugRepository = Depends(get
     return None
 
 
-# --- Service groups ---
+# --- Teams ---
 
 
-@router.get("/service-groups", response_model=PaginatedServiceGroups)
-async def list_service_groups(
+@router.get("/teams", response_model=PaginatedTeams)
+async def list_teams(
     *,
     repo: BugRepository = Depends(get_repo),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=100),
 ):
-    items, total = await repo.list_service_groups(page=page, page_size=page_size)
+    items, total = await repo.list_teams(page=page, page_size=page_size)
     result_items = [
-        ServiceGroupResponse(
-            id=str(g.id),
-            slack_group_id=g.slack_group_id,
-            oncall_engineer=g.oncall_engineer,
-            created_at=g.created_at,
-            updated_at=g.updated_at,
+        TeamResponse(
+            id=str(t.id),
+            slack_group_id=t.slack_group_id,
+            oncall_engineer=t.oncall_engineer,
+            rotation_enabled=t.rotation_enabled,
+            rotation_type=t.rotation_type,
+            rotation_order=t.rotation_order,
+            rotation_start_date=t.rotation_start_date,
+            current_rotation_index=t.current_rotation_index,
+            created_at=t.created_at,
+            updated_at=t.updated_at,
         )
-        for g in items
+        for t in items
     ]
-    return PaginatedServiceGroups(items=result_items, total=total, page=page, page_size=page_size)
+    return PaginatedTeams(items=result_items, total=total, page=page, page_size=page_size)
 
 
-@router.post("/service-groups", status_code=status.HTTP_201_CREATED, response_model=ServiceGroupResponse)
-async def create_service_group(
-    payload: ServiceGroupCreate,
+@router.post("/teams", status_code=status.HTTP_201_CREATED, response_model=TeamResponse)
+async def create_team(
+    payload: TeamCreate,
     repo: BugRepository = Depends(get_repo),
 ):
     data = payload.model_dump()
-    g = await repo.create_service_group(data)
-    return ServiceGroupResponse(
-        id=str(g.id),
-        slack_group_id=g.slack_group_id,
-        oncall_engineer=g.oncall_engineer,
-        created_at=g.created_at,
-        updated_at=g.updated_at,
+    t = await repo.create_team(data)
+    return TeamResponse(
+        id=str(t.id),
+        slack_group_id=t.slack_group_id,
+        oncall_engineer=t.oncall_engineer,
+        rotation_enabled=t.rotation_enabled,
+        rotation_type=t.rotation_type,
+        rotation_order=t.rotation_order,
+        rotation_start_date=t.rotation_start_date,
+        current_rotation_index=t.current_rotation_index,
+        created_at=t.created_at,
+        updated_at=t.updated_at,
     )
 
 
-@router.get("/service-groups/{id}", response_model=ServiceGroupResponse)
-async def get_service_group(id: str, repo: BugRepository = Depends(get_repo)):
-    g = await repo.get_service_group_by_id(id)
-    if g is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service group not found")
-    return ServiceGroupResponse(
-        id=str(g.id),
-        slack_group_id=g.slack_group_id,
-        oncall_engineer=g.oncall_engineer,
-        created_at=g.created_at,
-        updated_at=g.updated_at,
+@router.get("/teams/{id}", response_model=TeamResponse)
+async def get_team(id: str, repo: BugRepository = Depends(get_repo)):
+    t = await repo.get_team_by_id(id)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+    return TeamResponse(
+        id=str(t.id),
+        slack_group_id=t.slack_group_id,
+        oncall_engineer=t.oncall_engineer,
+        rotation_enabled=t.rotation_enabled,
+        rotation_type=t.rotation_type,
+        rotation_order=t.rotation_order,
+        rotation_start_date=t.rotation_start_date,
+        current_rotation_index=t.current_rotation_index,
+        created_at=t.created_at,
+        updated_at=t.updated_at,
     )
 
 
-@router.patch("/service-groups/{id}", response_model=ServiceGroupResponse)
-async def update_service_group(
+@router.patch("/teams/{id}", response_model=TeamResponse)
+async def update_team(
     id: str,
-    payload: ServiceGroupUpdate,
+    payload: TeamUpdate,
     repo: BugRepository = Depends(get_repo),
 ):
     data = {k: v for k, v in payload.model_dump().items() if v is not None}
-    g = await repo.update_service_group(id, data)
-    if g is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service group not found")
-    return ServiceGroupResponse(
-        id=str(g.id),
-        slack_group_id=g.slack_group_id,
-        oncall_engineer=g.oncall_engineer,
-        created_at=g.created_at,
-        updated_at=g.updated_at,
+    t = await repo.update_team(id, data)
+    if t is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+    return TeamResponse(
+        id=str(t.id),
+        slack_group_id=t.slack_group_id,
+        oncall_engineer=t.oncall_engineer,
+        rotation_enabled=t.rotation_enabled,
+        rotation_type=t.rotation_type,
+        rotation_order=t.rotation_order,
+        rotation_start_date=t.rotation_start_date,
+        current_rotation_index=t.current_rotation_index,
+        created_at=t.created_at,
+        updated_at=t.updated_at,
     )
 
 
-@router.delete("/service-groups/{id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_service_group(id: str, repo: BugRepository = Depends(get_repo)):
-    await repo.delete_service_group(id)
+@router.delete("/teams/{id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_team(id: str, repo: BugRepository = Depends(get_repo)):
+    await repo.delete_team(id)
     return None
+
+
+# --- On-Call Scheduling ---
+
+
+@router.get(
+    "/teams/{team_id}/oncall-schedules",
+    response_model=PaginatedOnCallSchedules,
+)
+async def list_oncall_schedules(
+    team_id: str,
+    repo: BugRepository = Depends(get_repo),
+    start_date: date | None = Query(default=None, description="Filter schedules starting on or after this date"),
+    end_date: date | None = Query(default=None, description="Filter schedules ending on or before this date"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    """List on-call schedules for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    items, total = await repo.get_oncall_schedules_by_team(
+        team_id=team_id,
+        start_date=start_date,
+        end_date=end_date,
+        page=page,
+        page_size=page_size,
+    )
+    result_items = [
+        OnCallScheduleResponse(
+            id=str(s.id),
+            team_id=str(s.team_id),
+            engineer_slack_id=s.engineer_slack_id,
+            start_date=s.start_date,
+            end_date=s.end_date,
+            schedule_type=s.schedule_type,
+            days_of_week=s.days_of_week,
+            created_by=s.created_by,
+            created_at=s.created_at,
+            updated_at=s.updated_at,
+        )
+        for s in items
+    ]
+    return PaginatedOnCallSchedules(
+        items=result_items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post(
+    "/teams/{team_id}/oncall-schedules",
+    status_code=status.HTTP_201_CREATED,
+    response_model=OnCallScheduleResponse,
+)
+async def create_oncall_schedule(
+    team_id: str,
+    payload: OnCallScheduleCreate,
+    created_by: str = Query(..., description="Slack user ID of the person creating the schedule"),
+    repo: BugRepository = Depends(get_repo),
+):
+    """Create a new on-call schedule."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    try:
+        schedule = await oncall_service.assign_oncall(
+            repo=repo,
+            team_id=team_id,
+            engineer_slack_id=payload.engineer_slack_id,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            schedule_type=payload.schedule_type,
+            created_by=created_by,
+            days_of_week=payload.days_of_week,
+            send_notification=True,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return OnCallScheduleResponse(
+        id=str(schedule.id),
+        team_id=str(schedule.team_id),
+        engineer_slack_id=schedule.engineer_slack_id,
+        start_date=schedule.start_date,
+        end_date=schedule.end_date,
+        schedule_type=schedule.schedule_type,
+        days_of_week=schedule.days_of_week,
+        created_by=schedule.created_by,
+        created_at=schedule.created_at,
+        updated_at=schedule.updated_at,
+    )
+
+
+@router.get(
+    "/teams/{team_id}/oncall-schedules/{schedule_id}",
+    response_model=OnCallScheduleResponse,
+)
+async def get_oncall_schedule(
+    team_id: str,
+    schedule_id: str,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Get a single on-call schedule."""
+    schedule = await repo.get_oncall_schedule_by_id(schedule_id)
+    if schedule is None or str(schedule.team_id) != team_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+    return OnCallScheduleResponse(
+        id=str(schedule.id),
+        team_id=str(schedule.team_id),
+        engineer_slack_id=schedule.engineer_slack_id,
+        start_date=schedule.start_date,
+        end_date=schedule.end_date,
+        schedule_type=schedule.schedule_type,
+        days_of_week=schedule.days_of_week,
+        created_by=schedule.created_by,
+        created_at=schedule.created_at,
+        updated_at=schedule.updated_at,
+    )
+
+
+@router.patch(
+    "/teams/{team_id}/oncall-schedules/{schedule_id}",
+    response_model=OnCallScheduleResponse,
+)
+async def update_oncall_schedule(
+    team_id: str,
+    schedule_id: str,
+    payload: OnCallScheduleUpdate,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Update an on-call schedule."""
+    schedule = await repo.get_oncall_schedule_by_id(schedule_id)
+    if schedule is None or str(schedule.team_id) != team_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    # Check for overlaps if dates are being updated
+    update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    start_date = update_data.get("start_date", schedule.start_date)
+    end_date = update_data.get("end_date", schedule.end_date)
+
+    if await repo.check_schedule_overlap(team_id, start_date, end_date, exclude_id=schedule_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Updated schedule overlaps with existing schedule",
+        )
+
+    updated = await repo.update_oncall_schedule(schedule_id, update_data)
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    # Log history
+    await repo.log_oncall_change(
+        team_id=team_id,
+        engineer_slack_id=updated.engineer_slack_id,
+        change_type="schedule_updated",
+        effective_date=updated.start_date,
+        previous_engineer_slack_id=schedule.engineer_slack_id if schedule.engineer_slack_id != updated.engineer_slack_id else None,
+        change_reason="Schedule updated",
+    )
+
+    return OnCallScheduleResponse(
+        id=str(updated.id),
+        team_id=str(updated.team_id),
+        engineer_slack_id=updated.engineer_slack_id,
+        start_date=updated.start_date,
+        end_date=updated.end_date,
+        schedule_type=updated.schedule_type,
+        days_of_week=updated.days_of_week,
+        created_by=updated.created_by,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
+    )
+
+
+@router.delete(
+    "/teams/{team_id}/oncall-schedules/{schedule_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_oncall_schedule(
+    team_id: str,
+    schedule_id: str,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Delete an on-call schedule."""
+    schedule = await repo.get_oncall_schedule_by_id(schedule_id)
+    if schedule is None or str(schedule.team_id) != team_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    # Log history before deleting
+    await repo.log_oncall_change(
+        team_id=team_id,
+        engineer_slack_id=schedule.engineer_slack_id,
+        change_type="schedule_deleted",
+        effective_date=schedule.start_date,
+        previous_engineer_slack_id=schedule.engineer_slack_id,
+        change_reason="Schedule deleted",
+    )
+
+    await repo.delete_oncall_schedule(schedule_id)
+    return None
+
+
+@router.get(
+    "/teams/{team_id}/current-oncall",
+    response_model=CurrentOnCallResponse,
+)
+async def get_current_oncall(
+    team_id: str,
+    check_date: date | None = Query(default=None, description="Date to check (defaults to today)"),
+    repo: BugRepository = Depends(get_repo),
+):
+    """Get current on-call engineer for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    current = await oncall_service.get_current_oncall(repo, team_id, check_date)
+    if current is None:
+        return CurrentOnCallResponse(
+            engineer_slack_id=None,
+            effective_date=None,
+            source=None,
+            schedule_id=None,
+        )
+
+    return CurrentOnCallResponse(
+        engineer_slack_id=current.get("engineer_slack_id"),
+        effective_date=current.get("effective_date"),
+        source=current.get("source"),
+        schedule_id=current.get("schedule_id"),
+    )
+
+
+@router.get(
+    "/teams/{team_id}/oncall-history",
+    response_model=PaginatedOnCallHistory,
+)
+async def get_oncall_history(
+    team_id: str,
+    repo: BugRepository = Depends(get_repo),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    """Get on-call history for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    items, total = await repo.get_oncall_history(
+        team_id=team_id,
+        page=page,
+        page_size=page_size,
+    )
+    result_items = [
+        OnCallHistoryResponse(
+            id=str(h.id),
+            team_id=str(h.team_id),
+            engineer_slack_id=h.engineer_slack_id,
+            previous_engineer_slack_id=h.previous_engineer_slack_id,
+            change_type=h.change_type,
+            change_reason=h.change_reason,
+            effective_date=h.effective_date,
+            changed_by=h.changed_by,
+            created_at=h.created_at,
+        )
+        for h in items
+    ]
+    return PaginatedOnCallHistory(
+        items=result_items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.patch(
+    "/teams/{team_id}/rotation-config",
+    response_model=TeamResponse,
+)
+async def update_rotation_config(
+    team_id: str,
+    payload: TeamRotationConfigUpdate,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Update rotation configuration for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    updated = await repo.update_team(team_id, data)
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    return TeamResponse(
+        id=str(updated.id),
+        slack_group_id=updated.slack_group_id,
+        oncall_engineer=updated.oncall_engineer,
+        rotation_enabled=updated.rotation_enabled,
+        rotation_type=updated.rotation_type,
+        rotation_order=updated.rotation_order,
+        rotation_start_date=updated.rotation_start_date,
+        current_rotation_index=updated.current_rotation_index,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
+    )
+
+
+@router.post(
+    "/teams/{team_id}/rotate",
+    response_model=TeamResponse,
+)
+async def trigger_rotation(
+    team_id: str,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Manually trigger rotation for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    if not team.rotation_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rotation is not enabled for this team",
+        )
+
+    rotated = await oncall_service.process_auto_rotation(repo, team_id)
+    if not rotated:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rotation could not be applied (check rotation configuration)",
+        )
+
+    # Reload team to get updated values
+    updated = await repo.get_team_by_id(team_id)
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    return TeamResponse(
+        id=str(updated.id),
+        slack_group_id=updated.slack_group_id,
+        oncall_engineer=updated.oncall_engineer,
+        rotation_enabled=updated.rotation_enabled,
+        rotation_type=updated.rotation_type,
+        rotation_order=updated.rotation_order,
+        rotation_start_date=updated.rotation_start_date,
+        current_rotation_index=updated.current_rotation_index,
+        created_at=updated.created_at,
+        updated_at=updated.updated_at,
+    )
 
 
 # --- Slack user groups (admin) ---

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, NonNegativeInt
@@ -120,33 +120,53 @@ class SLAConfigListResponse(BaseModel):
     items: list[SLAConfigResponse]
 
 
-class ServiceGroupBase(BaseModel):
+class TeamBase(BaseModel):
     slack_group_id: str          # Slack user group ID from GET /slack/user-groups
     oncall_engineer: str | None = None  # Slack user ID — pick from GET /slack/user-groups/users
 
 
-class ServiceGroupCreate(ServiceGroupBase):
+class TeamCreate(TeamBase):
     pass
 
 
-class ServiceGroupUpdate(BaseModel):
+class TeamUpdate(BaseModel):
     oncall_engineer: str | None = None  # only oncall_engineer is mutable after creation
 
 
-class ServiceGroupResponse(ServiceGroupBase):
+class TeamRotationConfigUpdate(BaseModel):
+    rotation_enabled: bool | None = None
+    rotation_type: Literal["round_robin", "custom_order"] | None = None
+    rotation_order: list[str] | None = None
+    rotation_start_date: date | None = None
+
+
+class TeamRotationConfig(BaseModel):
+    rotation_enabled: bool = False
+    rotation_type: Literal["round_robin", "custom_order"] | None = None
+    rotation_order: list[str] | None = None  # array of Slack user IDs for custom_order
+    rotation_start_date: date | None = None
+    current_rotation_index: int | None = None
+
+
+class TeamResponse(TeamBase):
     id: str
+    rotation_enabled: bool = False
+    rotation_type: Literal["round_robin", "custom_order"] | None = None
+    rotation_order: list[str] | None = None
+    rotation_start_date: date | None = None
+    current_rotation_index: int | None = None
     created_at: datetime
     updated_at: datetime
 
 
-class PaginatedServiceGroups(BaseModel):
-    items: list[ServiceGroupResponse]
+class PaginatedTeams(BaseModel):
+    items: list[TeamResponse]
     total: NonNegativeInt
     page: int
     page_size: int
 
 
-class ServiceGroupSummary(BaseModel):
+class TeamSummary(BaseModel):
     id: str
     slack_group_id: str       # Slack user group ID — look up name/handle via GET /slack/user-groups
     oncall_engineer: str | None
@@ -159,7 +179,7 @@ class ServiceTeamMappingBase(BaseModel):
     primary_oncall: str | None = None
     tech_stack: str
     service_owner: str | None = None
-    group_id: str | None = None
+    team_id: str | None = None
 
 
 class ServiceTeamMappingCreate(ServiceTeamMappingBase):
@@ -173,13 +193,13 @@ class ServiceTeamMappingUpdate(BaseModel):
     primary_oncall: str | None = None
     tech_stack: str | None = None
     service_owner: str | None = None
-    group_id: str | None = None
+    team_id: str | None = None
 
 
 class ServiceTeamMappingResponse(ServiceTeamMappingBase):
     id: str
     created_at: datetime
-    group: ServiceGroupSummary | None = None  # populated when group_id is set
+    team: TeamSummary | None = None  # populated when team_id is set
 
 
 class PaginatedServiceTeamMappings(BaseModel):
@@ -236,4 +256,68 @@ class SlackUserGroupUsersResponse(BaseModel):
     usergroup_id: str
     user_ids: list[str]
     users: list[SlackUserDetail] | None = None
+
+
+# --- On-Call Scheduling ---
+
+
+class OnCallScheduleBase(BaseModel):
+    engineer_slack_id: str
+    start_date: date
+    end_date: date
+    schedule_type: Literal["weekly", "daily"]
+    days_of_week: list[int] | None = None  # array of day numbers [0-6] for daily schedules (0=Monday)
+
+
+class OnCallScheduleCreate(OnCallScheduleBase):
+    pass
+
+
+class OnCallScheduleUpdate(BaseModel):
+    engineer_slack_id: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    schedule_type: Literal["weekly", "daily"] | None = None
+    days_of_week: list[int] | None = None
+
+
+class OnCallScheduleResponse(OnCallScheduleBase):
+    id: str
+    team_id: str
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaginatedOnCallSchedules(BaseModel):
+    items: list[OnCallScheduleResponse]
+    total: NonNegativeInt
+    page: int
+    page_size: int
+
+
+class OnCallHistoryResponse(BaseModel):
+    id: str
+    team_id: str
+    engineer_slack_id: str
+    previous_engineer_slack_id: str | None = None
+    change_type: Literal["manual", "auto_rotation", "schedule_created", "schedule_updated", "schedule_deleted"]
+    change_reason: str | None = None
+    effective_date: date
+    changed_by: str | None = None
+    created_at: datetime
+
+
+class PaginatedOnCallHistory(BaseModel):
+    items: list[OnCallHistoryResponse]
+    total: NonNegativeInt
+    page: int
+    page_size: int
+
+
+class CurrentOnCallResponse(BaseModel):
+    engineer_slack_id: str | None
+    effective_date: date | None
+    source: Literal["schedule", "rotation", "manual"] | None
+    schedule_id: str | None = None
 

@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 
-from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, ForeignKey, Index
+from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, Date, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -96,19 +96,27 @@ class Escalation(Base):
     bug_report: Mapped["BugReport"] = relationship(back_populates="escalations")
 
 
-class ServiceGroup(Base):
-    __tablename__ = "service_groups"
+class Team(Base):
+    __tablename__ = "teams"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # Slack user group ID (from GET /slack/user-groups) — source of group identity.
+    # Slack user group ID (from GET /slack/user-groups) — source of team identity.
     # Names and handles come from the Slack API; we don't duplicate them here.
     slack_group_id: Mapped[str] = mapped_column(String(30), unique=True, nullable=False)
     oncall_engineer: Mapped[str | None] = mapped_column(String(20))  # Slack user ID
+    # Rotation configuration
+    rotation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    rotation_type: Mapped[str | None] = mapped_column(String(20))  # 'round_robin' | 'custom_order'
+    rotation_order: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # array of Slack user IDs
+    rotation_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    current_rotation_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
-    services: Mapped[list["ServiceTeamMapping"]] = relationship(back_populates="group")
+    services: Mapped[list["ServiceTeamMapping"]] = relationship(back_populates="team")
+    schedules: Mapped[list["OnCallSchedule"]] = relationship(back_populates="team", cascade="all, delete-orphan")
+    history: Mapped[list["OnCallHistory"]] = relationship(back_populates="team", cascade="all, delete-orphan")
 
 
 class ServiceTeamMapping(Base):
@@ -121,11 +129,11 @@ class ServiceTeamMapping(Base):
     primary_oncall: Mapped[str | None] = mapped_column(String(20))
     tech_stack: Mapped[str] = mapped_column(String(20), nullable=False)
     service_owner: Mapped[str | None] = mapped_column(String(20))  # permanent tech owner Slack ID
-    group_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_groups.id", ondelete="SET NULL"), nullable=True
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    group: Mapped["ServiceGroup | None"] = relationship(back_populates="services")
+    team: Mapped["Team | None"] = relationship(back_populates="services")
 
 
 class BugConversation(Base):
@@ -164,4 +172,51 @@ class InvestigationFinding(Base):
     __table_args__ = (
         Index("idx_investigation_findings_bug_id", "bug_id"),
         Index("idx_investigation_findings_category", "category"),
+    )
+
+
+class OnCallSchedule(Base):
+    __tablename__ = "oncall_schedules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False
+    )
+    engineer_slack_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    start_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    schedule_type: Mapped[str] = mapped_column(String(10), nullable=False)  # 'weekly' | 'daily'
+    days_of_week: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # array of day numbers [0-6] for daily schedules
+    created_by: Mapped[str] = mapped_column(String(20), nullable=False)  # Slack user ID
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    team: Mapped["Team"] = relationship(back_populates="schedules")
+
+    __table_args__ = (
+        Index("idx_oncall_schedules_team_start", "team_id", "start_date"),
+        Index("idx_oncall_schedules_team_end", "team_id", "end_date"),
+    )
+
+
+class OnCallHistory(Base):
+    __tablename__ = "oncall_history"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False
+    )
+    engineer_slack_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    previous_engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    change_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'manual' | 'auto_rotation' | 'schedule_created' | 'schedule_updated' | 'schedule_deleted'
+    change_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    effective_date: Mapped[date] = mapped_column(Date, nullable=False)
+    changed_by: Mapped[str | None] = mapped_column(String(20), nullable=True)  # Slack user ID (null for auto-rotation)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    team: Mapped["Team"] = relationship(back_populates="history")
+
+    __table_args__ = (
+        Index("idx_oncall_history_team_effective", "team_id", "effective_date"),
+        Index("idx_oncall_history_team_created", "team_id", "created_at"),
     )
