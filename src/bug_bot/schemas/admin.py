@@ -50,6 +50,7 @@ class BugListItem(BaseModel):
     assignee_user_id: str | None = None
     investigation_summary: InvestigationSummary | None = None
     tagged_on: list[TaggedOnEntry] = []
+    current_on_call: list[TaggedOnEntry] = []
 
 
 class PaginatedBugs(BaseModel):

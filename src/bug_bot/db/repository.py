@@ -350,10 +350,13 @@ class BugRepository:
         await self.session.delete(team)
         await self.session.commit()
 
-    async def get_oncall_for_services(self, service_names: list[str]) -> list[dict]:
+    async def get_oncall_for_services(
+        self, service_names: list[str], check_date: date | None = None
+    ) -> list[dict]:
         """Return deduped on-call info for given services.
 
         Checks active schedule first, then team oncall_engineer, then service primary_oncall.
+        When check_date is provided, resolves on-call as of that date (for historical tagged_on).
         """
         if not service_names:
             return []
@@ -367,7 +370,7 @@ class BugRepository:
         results = await self.session.execute(stmt)
         seen: set[str] = set()
         entries: list[dict] = []
-        today = date.today()
+        resolved_date = check_date if check_date is not None else date.today()
 
         for mapping, team in results.all():
             oncall = None
@@ -376,7 +379,9 @@ class BugRepository:
             if team:
                 slack_group_id = team.slack_group_id
                 # Check for active schedule first
-                current = await self.get_current_oncall_for_team(str(team.id), check_date=today)
+                current = await self.get_current_oncall_for_team(
+                    str(team.id), check_date=resolved_date
+                )
                 if current:
                     oncall = current.get("engineer_slack_id")
                 # Fallback to team oncall_engineer
