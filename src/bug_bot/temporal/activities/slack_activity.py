@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from temporalio import activity
 
@@ -34,6 +34,7 @@ class PostResultsInput:
     bug_id: str
     severity: str
     result: dict  # serialized InvestigationResult
+    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, slack_group_id}, ...]
 
 
 @dataclass
@@ -44,6 +45,7 @@ class EscalationInput:
     severity: str
     relevant_services: list[str]
     escalation_level: int = 1
+    oncall_entries: list[dict] = field(default_factory=list)  # [{oncall_engineer, slack_group_id}, ...]
 
 
 @activity.defn
@@ -106,14 +108,34 @@ async def create_summary_thread(input: PostResultsInput) -> str:
         original_thread_ts=input.thread_ts,
     )
     detail_blocks = format_investigation_result(input.result, input.bug_id)
+
+    # Build on-call mention blocks/text so on-call engineers get notified in #bug-summaries.
+    parts: list[str] = []
+    for entry in input.oncall_entries:
+        if entry.get("slack_group_id"):
+            parts.append(f"<!subteam^{entry['slack_group_id']}>")
+        elif entry.get("oncall_engineer"):
+            parts.append(f"<@{entry['oncall_engineer']}>")
+
     fallback_text = f"Bug investigation results: {input.bug_id}"
+    mention_blocks: list[dict] = []
+    if parts:
+        mention_str = " ".join(parts)
+        mention_blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"{mention_str} — please review."},
+            }
+        )
+        fallback_text += f" — {mention_str} please review."
+
     mode = settings.summary_post_mode
 
     if mode == "threaded":
-        # Post the brief header as the top-level message …
+        # Post the brief header (plus any mention block) as the top-level message …
         response = await client.chat_postMessage(
             channel=settings.bug_summaries_channel_id,
-            blocks=header_blocks,
+            blocks=header_blocks + mention_blocks,
             text=fallback_text,
         )
         summary_ts = response.get("ts", "")
@@ -127,11 +149,11 @@ async def create_summary_thread(input: PostResultsInput) -> str:
             )
         return summary_ts
 
-    elif mode == "canvas":
-        # Post the brief header as the top-level message …
+    if mode == "canvas":
+        # Post the brief header (plus any mention block) as the top-level message …
         response = await client.chat_postMessage(
             channel=settings.bug_summaries_channel_id,
-            blocks=header_blocks,
+            blocks=header_blocks + mention_blocks,
             text=fallback_text,
         )
         summary_ts = response.get("ts", "")
@@ -163,14 +185,14 @@ async def create_summary_thread(input: PostResultsInput) -> str:
                 )
         return summary_ts
 
-    else:  # "flat" — default, current behaviour
-        blocks = header_blocks + [{"type": "divider"}] + detail_blocks
-        response = await client.chat_postMessage(
-            channel=settings.bug_summaries_channel_id,
-            blocks=blocks,
-            text=fallback_text,
-        )
-        return response.get("ts", "")
+    # "flat" — default, current behaviour
+    blocks = header_blocks + mention_blocks + [{"type": "divider"}] + detail_blocks
+    response = await client.chat_postMessage(
+        channel=settings.bug_summaries_channel_id,
+        blocks=blocks,
+        text=fallback_text,
+    )
+    return response.get("ts", "")
 
 
 @activity.defn
@@ -182,14 +204,27 @@ async def escalate_to_humans(input: EscalationInput) -> None:
         f"Services: {', '.join(input.relevant_services) or 'Unknown'} — "
         f"Requires human investigation."
     )
+
+    parts = []
+    for entry in input.oncall_entries:
+        if entry.get("slack_group_id"):
+            parts.append(f"<!subteam^{entry['slack_group_id']}>")
+        elif entry.get("oncall_engineer"):
+            parts.append(f"<@{entry['oncall_engineer']}>")
+    mention_str = " ".join(parts)
+
+    text = f":rotating_light: *{msg}*"
+    if mention_str:
+        text += f"\n{mention_str} please investigate."
+
     if not _slack_configured():
-        activity.logger.info(f"[Slack skip] {msg}")
+        activity.logger.info(f"[Slack skip] {text}")
         return
     client = _get_slack_client()
     await client.chat_postMessage(
         channel=input.channel_id,
         thread_ts=input.thread_ts,
-        text=f":rotating_light: *{msg}*",
+        text=text,
     )
 
 

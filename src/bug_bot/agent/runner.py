@@ -154,6 +154,8 @@ def _run_sdk_sync(prompt: str, options: ClaudeAgentOptions) -> tuple:
     plain RuntimeError so Temporal treats it as a normal activity failure.
     """
     async def _inner():
+        import os
+        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             return await _collect_response(client)

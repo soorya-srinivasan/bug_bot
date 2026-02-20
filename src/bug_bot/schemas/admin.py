@@ -120,12 +120,46 @@ class SLAConfigListResponse(BaseModel):
     items: list[SLAConfigResponse]
 
 
+class ServiceGroupBase(BaseModel):
+    slack_group_id: str          # Slack user group ID from GET /slack/user-groups
+    oncall_engineer: str | None = None  # Slack user ID — pick from GET /slack/user-groups/users
+
+
+class ServiceGroupCreate(ServiceGroupBase):
+    pass
+
+
+class ServiceGroupUpdate(BaseModel):
+    oncall_engineer: str | None = None  # only oncall_engineer is mutable after creation
+
+
+class ServiceGroupResponse(ServiceGroupBase):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class PaginatedServiceGroups(BaseModel):
+    items: list[ServiceGroupResponse]
+    total: NonNegativeInt
+    page: int
+    page_size: int
+
+
+class ServiceGroupSummary(BaseModel):
+    id: str
+    slack_group_id: str       # Slack user group ID — look up name/handle via GET /slack/user-groups
+    oncall_engineer: str | None
+
+
 class ServiceTeamMappingBase(BaseModel):
     service_name: str
     github_repo: str
     team_slack_group: str | None = None
     primary_oncall: str | None = None
     tech_stack: str
+    service_owner: str | None = None
+    group_id: str | None = None
 
 
 class ServiceTeamMappingCreate(ServiceTeamMappingBase):
@@ -138,11 +172,14 @@ class ServiceTeamMappingUpdate(BaseModel):
     team_slack_group: str | None = None
     primary_oncall: str | None = None
     tech_stack: str | None = None
+    service_owner: str | None = None
+    group_id: str | None = None
 
 
 class ServiceTeamMappingResponse(ServiceTeamMappingBase):
     id: str
     created_at: datetime
+    group: ServiceGroupSummary | None = None  # populated when group_id is set
 
 
 class PaginatedServiceTeamMappings(BaseModel):
