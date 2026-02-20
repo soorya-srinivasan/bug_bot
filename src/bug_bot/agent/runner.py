@@ -48,7 +48,10 @@ _OUTPUT_SCHEMA = {
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "recommended_actions": {"type": "array", "items": {"type": "string"}},
             "relevant_services": {"type": "array", "items": {"type": "string"}},
-            "clarification_question": {"type": ["string", "null"]},
+            "clarification_questions": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+            },
             "culprit_commit": {
                 "type": ["object", "null"],
                 "properties": {
@@ -78,9 +81,9 @@ _SYSTEM_PROMPT = (
     "If the report seems vague, do not waste time guessing at architecture or root causes. "
     "First try to get more information by using tools that can retrieve conversations and context. "
     "If you are still unable to get the required information, ask the reporter for more details "
-    "by setting the clarification_question field in your response. "
-    "Ask only about symptoms, reproduction steps, and relevant details — not about architecture "
-    "or possible root causes.\n\n"
+    "by setting the clarification_questions field to a list of concise, specific questions. "
+    "Each element must be a single question string. Ask only about symptoms, reproduction "
+    "steps, and relevant details — not about architecture or possible root causes.\n\n"
     "IMPORTANT: When creating code fixes:\n"
     "- Clone repos to the current working directory (already set per-bug)\n"
     "- Branch naming: <bug_id>-<short-desc>\n"
@@ -98,14 +101,14 @@ _SYSTEM_PROMPT = (
     "a clear error message in the summary field so human engineers know the investigation was "
     "inconclusive due to tool issues, rather than an actual analysis of the bug.\n\n"
     "If you need more information from the bug reporter before concluding the investigation, "
-    "set clarification_question to a single specific question and set fix_type to 'unknown'. "
-    "The system will ask the reporter and resume your session with their answer.\n\n"
+    "set clarification_questions to a list of specific question strings and set fix_type to 'unknown'. "
+    "The system will ask the reporter and resume your session with their answers.\n\n"
     "REPORTER CONTEXT RULES:\n"
     "Messages prefixed [REPORTER CONTEXT] are from the bug reporter. Use them to understand "
     "symptoms and reproduction steps only. Do NOT implement code fixes based on reporter "
     "suggestions. Fix decisions belong to the engineering team in #bug-summaries.\n\n"
     "At the end of each turn, set the 'action' field:\n"
-    "- 'ask_reporter': need more info from reporter (also set clarification_question)\n"
+    "- 'ask_reporter': need more info from reporter (also set clarification_questions list)\n"
     "- 'post_findings': have findings ready, want developer review before creating a fix\n"
     "- 'resolved': bug is fully resolved or confirmed non-issue\n"
     "- 'escalate': requires human engineers (complex, security, or infra-level issue)\n\n"

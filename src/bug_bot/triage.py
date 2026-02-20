@@ -12,17 +12,15 @@ logger = logging.getLogger(__name__)
 _TRIAGE_SYSTEM_PROMPT_TEMPLATE = """\
 You are Bug Bot's triage classifier for ShopTech.
 Given a bug report from Slack, respond with a JSON object (no markdown fences) containing:
-- severity: P1 | P2 | P3 | P4
-- category: one of [api_error, ui_bug, data_issue, performance, security, infrastructure, unknown]
-- affected_services: list of canonical service_name values from the registry below that are likely affected
+- severity: P0 | P1 | P2 | P3
 - summary: one-sentence plain-English summary of the bug
 - needs_investigation: boolean, true unless the report is clearly spam/noise
 
 Severity guide:
-  P1 - Production is down or money-losing; needs immediate action
-  P2 - Major feature broken for many users
-  P3 - Bug with workaround available
-  P4 - Cosmetic / minor issue
+  P0 - Production is down or money-losing; needs immediate action
+  P1 - Major feature broken for many users
+  P2 - Bug with workaround available
+  P3 - Cosmetic / minor issue
 
 [SERVICE REGISTRY]
 {service_registry}
@@ -37,8 +35,6 @@ async def triage_bug_report(message_text: str, reporter_user_id: str) -> dict:
     """
     defaults = {
         "severity": "P3",
-        "category": "unknown",
-        "affected_services": [],
         "summary": message_text[:120],
         "needs_investigation": True,
     }

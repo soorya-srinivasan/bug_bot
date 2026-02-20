@@ -13,7 +13,9 @@ def build_continuation_prompt(bug_id: str, conversation_ids: list[str], state: s
         f'Start by calling get_bug_conversations(bug_id="{bug_id}") to review the full '
         "conversation history for this bug. The most recent entries correspond to the "
         f"new message(s) above. Do not repeat a clarification question the reporter "
-        "already answered — use the recorded answer in the history."
+        "already answered — use the recorded answer in the history. "
+        "If you still need more information, set clarification_questions to a list of "
+        "individual question strings (one question per list item)."
     )
     if state == "awaiting_reporter":
         instruction += (

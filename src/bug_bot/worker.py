@@ -23,6 +23,7 @@ from bug_bot.temporal.activities.slack_activity import (
     post_investigation_results,
     create_summary_thread,
     escalate_to_humans,
+    post_to_summary_thread,
     send_follow_up,
 )
 from bug_bot.temporal.activities.database_activity import (
@@ -91,6 +92,7 @@ async def main():
             post_investigation_results,
             create_summary_thread,
             escalate_to_humans,
+            post_to_summary_thread,
             send_follow_up,
             update_bug_status,
             update_bug_assignee,
