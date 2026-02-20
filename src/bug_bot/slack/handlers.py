@@ -613,14 +613,22 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
                 metadata={"attachments": dev_attachments} if dev_attachments else None,
             )
             convo_id = str(convo.id)
-        await handle.signal(
-            BugInvestigationWorkflow.incoming_message,
-            args=["developer", event.get("user", "unknown"), convo_id],
-        )
-        await client.chat_postMessage(
-            channel=event["channel"],
-            thread_ts=thread_ts,
-            text=":mag: Your message has been forwarded to the investigation.",
-        )
+        active = await _is_workflow_active(handle)
+        if active:
+            await handle.signal(
+                BugInvestigationWorkflow.incoming_message,
+                args=["developer", event.get("user", "unknown"), convo_id],
+            )
+            await client.chat_postMessage(
+                channel=event["channel"],
+                thread_ts=thread_ts,
+                text=":mag: Your message has been forwarded to the investigation.",
+            )
+        else:
+            await client.chat_postMessage(
+                channel=event["channel"],
+                thread_ts=thread_ts,
+                text=":white_check_mark: The investigation for this bug has already concluded. Your message has been logged.",
+            )
     except Exception:
         logger.exception("Failed to signal workflow for %s", bug.bug_id)
