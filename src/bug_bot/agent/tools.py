@@ -187,10 +187,13 @@ def _lookup_service_owner_sync(service_name: str) -> str:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT service_name, github_repo, team_slack_group,
-                           primary_oncall, tech_stack
-                    FROM service_team_mapping
-                    WHERE lower(service_name) = lower(%s)
+                    SELECT
+                        s.service_name, s.github_repo, s.tech_stack,
+                        s.team_slack_group, s.service_owner, s.primary_oncall,
+                        g.slack_group_id, g.oncall_engineer AS group_oncall
+                    FROM service_team_mapping s
+                    LEFT JOIN service_groups g ON s.group_id = g.id
+                    WHERE lower(s.service_name) = lower(%s)
                     LIMIT 1;
                     """,
                     (service_name,),
@@ -201,9 +204,10 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                 return (
                     f"Service: {row['service_name']}\n"
                     f"GitHub repo: {row['github_repo']}\n"
-                    f"Team Slack group: {row['team_slack_group'] or 'N/A'}\n"
-                    f"Primary on-call: {row['primary_oncall'] or 'N/A'}\n"
-                    f"Tech stack: {row['tech_stack']}"
+                    f"Tech stack: {row['tech_stack']}\n"
+                    f"Service owner: {row['service_owner'] or row['primary_oncall'] or 'N/A'}\n"
+                    f"Group Slack group: {row['slack_group_id'] or row['team_slack_group'] or 'N/A'}\n"
+                    f"Group on-call: {row['group_oncall'] or 'N/A'}"
                 )
     except Exception as e:
         return f"Error querying service mapping: {e}"
@@ -221,6 +225,35 @@ async def lookup_service_owner(args: dict[str, Any]) -> dict[str, Any]:
     return _text_result(text)
 
 
+def _list_services_sync() -> str:
+    """Return all canonical service names from service_team_mapping."""
+    if psycopg is None:
+        return "Error: psycopg not installed."
+    try:
+        with psycopg.connect(_bugbot_conninfo(), row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT service_name, tech_stack FROM service_team_mapping ORDER BY service_name;"
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return "No services registered."
+                lines = [f"- {r['service_name']} ({r['tech_stack']})" for r in rows]
+                return "Known services:\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error listing services: {e}"
+
+
+@tool(
+    "list_services",
+    "List all known service names registered in Bug Bot. Use this to find the canonical service name before calling lookup_service_owner or populating relevant_services.",
+    {},
+)
+async def list_services(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(_list_services_sync)
+    return _text_result(text)
+  
+ 
 def _report_finding_sync(bug_id: str, category: str, finding: str, severity: str) -> str:
     if psycopg is None:
         return "Error: psycopg not installed."
@@ -463,6 +496,7 @@ def build_custom_tools_server():
         version="1.0.0",
         tools=[
             lookup_service_owner,
+            list_services,
             report_finding,
             close_bug,
             get_bug_conversations,

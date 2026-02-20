@@ -12,11 +12,16 @@ from bug_bot.schemas.admin import (
     EscalationResponse,
     InvestigationResponse,
     PaginatedBugs,
+    PaginatedServiceGroups,
     PaginatedServiceTeamMappings,
     SLAConfigCreate,
     SLAConfigListResponse,
     SLAConfigResponse,
     SLAConfigUpdate,
+    ServiceGroupCreate,
+    ServiceGroupResponse,
+    ServiceGroupSummary,
+    ServiceGroupUpdate,
     ServiceTeamMappingCreate,
     ServiceTeamMappingResponse,
     ServiceTeamMappingUpdate,
@@ -358,6 +363,8 @@ async def list_service_team_mappings(
             team_slack_group=m.team_slack_group,
             primary_oncall=m.primary_oncall,
             tech_stack=m.tech_stack,
+            service_owner=m.service_owner,
+            group_id=str(m.group_id) if m.group_id else None,
             created_at=m.created_at,
         )
         for m in items
@@ -370,6 +377,28 @@ async def list_service_team_mappings(
     )
 
 
+def _mapping_response(m) -> ServiceTeamMappingResponse:
+    group_summary = None
+    if m.group is not None:
+        group_summary = ServiceGroupSummary(
+            id=str(m.group.id),
+            slack_group_id=m.group.slack_group_id,
+            oncall_engineer=m.group.oncall_engineer,
+        )
+    return ServiceTeamMappingResponse(
+        id=str(m.id),
+        service_name=m.service_name,
+        github_repo=m.github_repo,
+        team_slack_group=m.team_slack_group,
+        primary_oncall=m.primary_oncall,
+        tech_stack=m.tech_stack,
+        service_owner=m.service_owner,
+        group_id=str(m.group_id) if m.group_id else None,
+        created_at=m.created_at,
+        group=group_summary,
+    )
+
+
 @router.get(
     "/service-team-mappings/{id}",
     response_model=ServiceTeamMappingResponse,
@@ -378,15 +407,7 @@ async def get_service_team_mapping(id: str, repo: BugRepository = Depends(get_re
     m = await repo.get_service_mapping_by_id(id)
     if m is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mapping not found")
-    return ServiceTeamMappingResponse(
-        id=str(m.id),
-        service_name=m.service_name,
-        github_repo=m.github_repo,
-        team_slack_group=m.team_slack_group,
-        primary_oncall=m.primary_oncall,
-        tech_stack=m.tech_stack,
-        created_at=m.created_at,
-    )
+    return _mapping_response(m)
 
 
 @router.post(
@@ -400,15 +421,9 @@ async def create_service_team_mapping(
 ):
     data = payload.model_dump()
     m = await repo.create_service_mapping(data)
-    return ServiceTeamMappingResponse(
-        id=str(m.id),
-        service_name=m.service_name,
-        github_repo=m.github_repo,
-        team_slack_group=m.team_slack_group,
-        primary_oncall=m.primary_oncall,
-        tech_stack=m.tech_stack,
-        created_at=m.created_at,
-    )
+    # Reload to get the eager-loaded group relationship
+    m = await repo.get_service_mapping_by_id(str(m.id))
+    return _mapping_response(m)
 
 
 @router.patch(
@@ -424,20 +439,93 @@ async def update_service_team_mapping(
     m = await repo.update_service_mapping(id, data)
     if m is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mapping not found")
-    return ServiceTeamMappingResponse(
-        id=str(m.id),
-        service_name=m.service_name,
-        github_repo=m.github_repo,
-        team_slack_group=m.team_slack_group,
-        primary_oncall=m.primary_oncall,
-        tech_stack=m.tech_stack,
-        created_at=m.created_at,
-    )
+    # Reload to get the eager-loaded group relationship
+    m = await repo.get_service_mapping_by_id(str(m.id))
+    return _mapping_response(m)
 
 
 @router.delete("/service-team-mappings/{id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_service_team_mapping(id: str, repo: BugRepository = Depends(get_repo)):
     await repo.delete_service_mapping(id)
+    return None
+
+
+# --- Service groups ---
+
+
+@router.get("/service-groups", response_model=PaginatedServiceGroups)
+async def list_service_groups(
+    *,
+    repo: BugRepository = Depends(get_repo),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    items, total = await repo.list_service_groups(page=page, page_size=page_size)
+    result_items = [
+        ServiceGroupResponse(
+            id=str(g.id),
+            slack_group_id=g.slack_group_id,
+            oncall_engineer=g.oncall_engineer,
+            created_at=g.created_at,
+            updated_at=g.updated_at,
+        )
+        for g in items
+    ]
+    return PaginatedServiceGroups(items=result_items, total=total, page=page, page_size=page_size)
+
+
+@router.post("/service-groups", status_code=status.HTTP_201_CREATED, response_model=ServiceGroupResponse)
+async def create_service_group(
+    payload: ServiceGroupCreate,
+    repo: BugRepository = Depends(get_repo),
+):
+    data = payload.model_dump()
+    g = await repo.create_service_group(data)
+    return ServiceGroupResponse(
+        id=str(g.id),
+        slack_group_id=g.slack_group_id,
+        oncall_engineer=g.oncall_engineer,
+        created_at=g.created_at,
+        updated_at=g.updated_at,
+    )
+
+
+@router.get("/service-groups/{id}", response_model=ServiceGroupResponse)
+async def get_service_group(id: str, repo: BugRepository = Depends(get_repo)):
+    g = await repo.get_service_group_by_id(id)
+    if g is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service group not found")
+    return ServiceGroupResponse(
+        id=str(g.id),
+        slack_group_id=g.slack_group_id,
+        oncall_engineer=g.oncall_engineer,
+        created_at=g.created_at,
+        updated_at=g.updated_at,
+    )
+
+
+@router.patch("/service-groups/{id}", response_model=ServiceGroupResponse)
+async def update_service_group(
+    id: str,
+    payload: ServiceGroupUpdate,
+    repo: BugRepository = Depends(get_repo),
+):
+    data = {k: v for k, v in payload.model_dump().items() if v is not None}
+    g = await repo.update_service_group(id, data)
+    if g is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Service group not found")
+    return ServiceGroupResponse(
+        id=str(g.id),
+        slack_group_id=g.slack_group_id,
+        oncall_engineer=g.oncall_engineer,
+        created_at=g.created_at,
+        updated_at=g.updated_at,
+    )
+
+
+@router.delete("/service-groups/{id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_service_group(id: str, repo: BugRepository = Depends(get_repo)):
+    await repo.delete_service_group(id)
     return None
 
 

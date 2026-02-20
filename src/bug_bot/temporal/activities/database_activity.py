@@ -50,6 +50,17 @@ async def get_sla_config_for_severity(severity: str) -> dict | None:
 
 
 @activity.defn
+async def fetch_oncall_for_services(service_names: list[str]) -> list[dict]:
+    """Return on-call info (oncall_engineer, slack_group_id) for the given service names."""
+    activity.logger.info(f"Fetching on-call for services: {service_names}")
+    async with async_session() as session:
+        repo = BugRepository(session)
+        entries = await repo.get_oncall_for_services(service_names)
+        activity.logger.info(f"Found {len(entries)} on-call entries: {entries}")
+        return entries
+
+
+@activity.defn
 async def log_conversation_event(
     bug_id: str,
     message_type: str,

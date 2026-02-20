@@ -134,6 +134,9 @@ Follow these steps in order:
 
 ## Important
 - All database access is READ-ONLY. Do not attempt writes.
-- Use the `lookup_service_owner` tool to find repo and team info for services.
+- Call `list_services` early in your investigation to get all canonical service names.
+  Use ONLY those exact names in the `relevant_services` field of your output — this
+  ensures the right on-call engineers are paged on escalation.
+- Use `lookup_service_owner` with the canonical name to get repo and team info.
 - Use the `report_finding` tool to log significant observations during investigation.
 - Be thorough but time-efficient. Focus on the most likely causes first."""
