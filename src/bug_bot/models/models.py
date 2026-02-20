@@ -147,3 +147,21 @@ class BugConversation(Base):
         Index("idx_bug_conversations_bug_id", "bug_id"),
         Index("idx_bug_conversations_message_type", "message_type"),
     )
+
+
+class InvestigationFinding(Base):
+    __tablename__ = "investigation_findings"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    # category examples: "error_rate", "db_anomaly", "service_health", "metric", "log_pattern"
+    finding: Mapped[str] = mapped_column(Text, nullable=False)
+    severity: Mapped[str] = mapped_column(String(10), nullable=False)
+    # severity at tool level: "low" | "medium" | "high" | "critical"
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_investigation_findings_bug_id", "bug_id"),
+        Index("idx_investigation_findings_category", "category"),
+    )

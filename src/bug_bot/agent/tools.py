@@ -252,22 +252,44 @@ def _list_services_sync() -> str:
 async def list_services(args: dict[str, Any]) -> dict[str, Any]:
     text = await asyncio.to_thread(_list_services_sync)
     return _text_result(text)
+  
+ 
+def _report_finding_sync(bug_id: str, category: str, finding: str, severity: str) -> str:
+    if psycopg is None:
+        return "Error: psycopg not installed."
+    try:
+        with psycopg.connect(_bugbot_conninfo(), row_factory=dict_row, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO investigation_findings (id, bug_id, category, finding, severity)
+                    VALUES (gen_random_uuid(), %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (bug_id, category, finding, severity),
+                )
+                row = cur.fetchone()
+                finding_id = row["id"] if row else "unknown"
+        return f"Finding recorded (id={finding_id}): [{category}] ({severity}) {finding}"
+    except Exception as e:
+        return f"Error recording finding: {e}"
 
 
 @tool(
     "report_finding",
-    "Log a significant finding during investigation. Use for key observations, errors found, or metrics anomalies.",
-    {"category": str, "finding": str, "severity": str},
+    "Log a significant finding during investigation. Use for key observations, errors found, "
+    "or metrics anomalies. Always pass the bug_id of the current investigation.",
+    {"bug_id": str, "category": str, "finding": str, "severity": str},
 )
 async def report_finding(args: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "content": [
-            {
-                "type": "text",
-                "text": f"Finding recorded: [{args['category']}] ({args['severity']}) {args['finding']}",
-            }
-        ]
-    }
+    text = await asyncio.to_thread(
+        _report_finding_sync,
+        args["bug_id"],
+        args["category"],
+        args["finding"],
+        args["severity"],
+    )
+    return _text_result(text)
 
 
 @tool(

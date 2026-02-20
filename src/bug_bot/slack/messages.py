@@ -107,6 +107,32 @@ def format_triage_response(triage: dict, bug_id: str) -> str:
     )
 
 
+def format_investigation_as_markdown(result: dict, bug_id: str) -> str:
+    """Render investigation details as a Markdown document (for file-upload mode)."""
+    confidence = result.get("confidence", 0)
+    lines = [
+        f"# Investigation Results — {bug_id}",
+        "",
+        f"**Fix Type:** `{result.get('fix_type', 'unknown')}`  ",
+        f"**Confidence:** {confidence:.0%}",
+        "",
+        "## Summary",
+        "",
+        result.get("summary", ""),
+        "",
+    ]
+    if result.get("root_cause"):
+        lines += ["## Root Cause", "", result["root_cause"], ""]
+    if result.get("pr_url"):
+        lines += ["## Pull Request", "", f"[View PR]({result['pr_url']})", ""]
+    if result.get("recommended_actions"):
+        lines += ["## Recommended Actions", ""]
+        for action in result["recommended_actions"]:
+            lines.append(f"- {action}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def format_followup_question(question: str) -> list[dict]:
     """Format a follow-up question from the agent as Slack blocks."""
     return [
