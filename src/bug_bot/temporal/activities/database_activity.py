@@ -47,3 +47,23 @@ async def get_sla_config_for_severity(severity: str) -> dict | None:
             "escalation_threshold": config.escalation_threshold,
             "escalation_contacts": config.escalation_contacts,
         }
+
+
+@activity.defn
+async def log_conversation_event(
+    bug_id: str,
+    message_type: str,
+    sender_type: str,
+    sender_id: str | None = None,
+    channel: str | None = None,
+    message_text: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Append an event to the bug_conversations audit trail."""
+    async with async_session() as session:
+        repo = BugRepository(session)
+        await repo.log_conversation(
+            bug_id=bug_id, message_type=message_type, sender_type=sender_type,
+            sender_id=sender_id, channel=channel, message_text=message_text, metadata=metadata,
+        )
+    activity.logger.info(f"Conversation event logged for {bug_id}: type={message_type}")

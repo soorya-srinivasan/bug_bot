@@ -20,10 +20,12 @@ from bug_bot.temporal.activities.database_activity import (
     save_investigation_result,
     store_summary_thread_ts,
     get_sla_config_for_severity,
+    log_conversation_event,
 )
 from bug_bot.temporal.activities.agent_activity import (
     run_agent_investigation,
-    run_followup_investigation,
+    run_continuation_investigation,
+    cleanup_workspace,
 )
 
 
@@ -54,7 +56,9 @@ async def main():
             store_summary_thread_ts,
             get_sla_config_for_severity,
             run_agent_investigation,
-            run_followup_investigation,
+            run_continuation_investigation,
+            cleanup_workspace,
+            log_conversation_event,
         ],
     )
 

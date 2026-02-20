@@ -40,5 +40,7 @@ class Settings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
+    anthropic_log: str = "info"
+
 
 settings = Settings()
