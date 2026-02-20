@@ -12,6 +12,7 @@ from bug_bot.temporal.client import get_temporal_client
 from bug_bot.temporal import BugReportInput
 from bug_bot.temporal.workflows.bug_investigation import BugInvestigationWorkflow
 from bug_bot.triage import triage_bug_report
+from bug_bot.redact import redact_for_reporters
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,17 @@ def register_handlers(app: AsyncApp):
         if event.get("thread_ts"):
             return
 
+        # ── @mention gate (feature flag) ─────────────────────────────────────────
+        if settings.require_bot_mention and settings.slack_bot_user_id:
+            mention_token = f"<@{settings.slack_bot_user_id}>"
+            raw_text = event.get("text", "")
+            # Also scan blocks in case the mention lives there
+            block_text_for_scan = ""
+            if event.get("blocks"):
+                block_text_for_scan = _extract_text_from_blocks(event["blocks"])
+            if mention_token not in raw_text and f"@{settings.slack_bot_user_id}" not in block_text_for_scan:
+                return  # Not mentioned — ignore silently
+
         thread_ts = event["ts"]
         reporter = event.get("user", "unknown")
         text = event.get("text", "")
@@ -121,6 +133,15 @@ def register_handlers(app: AsyncApp):
             block_text = _extract_text_from_blocks(event["blocks"])
             if block_text and block_text not in text:
                 text = f"{text}\n{block_text}".strip() if text else block_text
+
+        # Strip bot mention from the text so it doesn't appear in the bug report
+        if settings.require_bot_mention and settings.slack_bot_user_id:
+            text = re.sub(
+                r'<@' + re.escape(settings.slack_bot_user_id) + r'(?:\|[^>]+)?>',
+                '',
+                text,
+            ).strip()
+
         bug_id = f"BUG-{int(float(thread_ts))}"
         workflow_id = f"bug-{thread_ts.replace('.', '-')}"
 
@@ -345,13 +366,30 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
         # ── Dev wants to close the bug ────────────────────────────────────────
         if text and _CLOSE_RE.search(text):
             await handle.signal(BugInvestigationWorkflow.close_requested)
+            # Ack in #bug-summaries — include the dev's reason so there's context.
+            ack_text = f":white_check_mark: Got it — `{bug.bug_id}` will be closed.\n*Reason:* {text}"
             await client.chat_postMessage(
                 channel=event["channel"],
                 thread_ts=thread_ts,
-                text=(
-                    f":white_check_mark: Got it — `{bug.bug_id}` will be closed. "
-                    "Thanks for the update!"
-                ),
+                text=ack_text,
+            )
+            # Notify the reporter in the original #bug-reports thread.
+            # Redact PII / sensitive org info from the reason before it reaches
+            # the reporter-facing channel; the summary channel keeps the original.
+            async with async_session() as _s:
+                inv = await BugRepository(_s).get_investigation(bug.bug_id)
+            pr_url = inv.pr_url if inv else None
+            safe_reason = await redact_for_reporters(text)
+            closure_text = (
+                f":white_check_mark: *{bug.bug_id}* has been marked as resolved.\n"
+                f"*Reason:* {safe_reason}"
+            )
+            if pr_url:
+                closure_text += f"\nA fix has been submitted: <{pr_url}|View PR>"
+            await client.chat_postMessage(
+                channel=bug.slack_channel_id,
+                thread_ts=bug.slack_thread_ts,
+                text=closure_text,
             )
             return
 
