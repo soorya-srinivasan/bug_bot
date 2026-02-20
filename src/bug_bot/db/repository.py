@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bug_bot.models.models import BugReport, Investigation, SLAConfig, Escalation, ServiceTeamMapping
+from bug_bot.models.models import BugReport, BugConversation, Investigation, SLAConfig, Escalation, ServiceTeamMapping
 
 
 class BugRepository:
@@ -20,6 +20,7 @@ class BugRepository:
         severity: str = "P3",
         status: str = "new",
         workflow_id: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> BugReport:
         report = BugReport(
             bug_id=bug_id,
@@ -30,6 +31,7 @@ class BugRepository:
             severity=severity,
             status=status,
             temporal_workflow_id=workflow_id,
+            attachments=attachments or [],
         )
         self.session.add(report)
         await self.session.commit()
@@ -123,3 +125,39 @@ class BugRepository:
         )
         await self.session.execute(stmt)
         await self.session.commit()
+
+    async def get_bug_by_id(self, bug_id: str) -> BugReport | None:
+        stmt = select(BugReport).where(BugReport.bug_id == bug_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_conversations(self, bug_id: str) -> list[BugConversation]:
+        result = await self.session.execute(
+            select(BugConversation)
+            .where(BugConversation.bug_id == bug_id)
+            .order_by(BugConversation.created_at)
+        )
+        return list(result.scalars().all())
+
+    async def log_conversation(
+        self,
+        bug_id: str,
+        message_type: str,
+        sender_type: str,
+        sender_id: str | None = None,
+        channel: str | None = None,
+        message_text: str | None = None,
+        metadata: dict | None = None,
+    ) -> BugConversation:
+        entry = BugConversation(
+            bug_id=bug_id,
+            message_type=message_type,
+            sender_type=sender_type,
+            sender_id=sender_id,
+            channel=channel,
+            message_text=message_text,
+            metadata_=metadata,
+        )
+        self.session.add(entry)
+        await self.session.commit()
+        return entry

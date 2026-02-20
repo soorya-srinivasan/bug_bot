@@ -60,6 +60,12 @@ async def triage_bug_report(message_text: str, reporter_user_id: str) -> dict:
             ],
         )
         text = response.content[0].text.strip()
+        # Strip markdown code fences that the model sometimes adds despite instructions
+        if text.startswith("```"):
+            text = text.split("```", 2)[1]          # drop opening fence line
+            if text.startswith("json"):
+                text = text[4:]                      # drop "json" language tag
+            text = text.rsplit("```", 1)[0].strip()  # drop closing fence
         result = json.loads(text)
         # Ensure all expected keys are present
         for key, default_val in defaults.items():
