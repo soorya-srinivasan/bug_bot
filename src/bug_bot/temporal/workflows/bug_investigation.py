@@ -21,6 +21,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from bug_bot.temporal.activities.database_activity import (
         update_bug_status,
+        update_bug_assignee,
         save_investigation_result,
         store_summary_thread_ts,
         log_conversation_event,
@@ -50,6 +51,12 @@ class BugInvestigationWorkflow:
         self._dev_replied: bool = False
         # Prevents creating a second summary thread on follow-up iterations.
         self._summary_thread_created: bool = False
+        # Guards against double-running cleanup_workspace when the finally block
+        # fires after a path that already called it explicitly.
+        self._workspace_cleaned: bool = False
+        # Dev takeover state
+        self._dev_takeover: bool = False
+        self._takeover_user_id: str | None = None
 
     @workflow.signal
     async def incoming_message(self, sender_type: str, sender_id: str, conversation_id: str) -> None:
@@ -64,10 +71,31 @@ class BugInvestigationWorkflow:
         """Reporter or developer asked to close/cancel the bug."""
         self._close_requested = True
 
+    @workflow.signal
+    async def dev_takeover(self, dev_user_id: str) -> None:
+        """Dev claimed ownership of the bug; stop further Claude investigations."""
+        self._dev_takeover = True
+        self._takeover_user_id = dev_user_id
+
     @workflow.run
     async def run(self, input: BugReportInput) -> dict:
         workflow.logger.info(f"Starting investigation for {input.bug_id}")
+        try:
+            return await self._run(input)
+        finally:
+            if not self._workspace_cleaned:
+                async with workflow.CancellationScope(detached=True):
+                    try:
+                        await workflow.execute_activity(
+                            cleanup_workspace, args=[input.bug_id],
+                            start_to_close_timeout=timedelta(seconds=30),
+                        )
+                    except Exception:
+                        workflow.logger.warning(
+                            "Cleanup activity failed for %s during teardown", input.bug_id
+                        )
 
+    async def _run(self, input: BugReportInput) -> dict:
         parsed: ParsedBug = await workflow.execute_activity(
             parse_bug_report, input,
             start_to_close_timeout=timedelta(seconds=30),
@@ -96,6 +124,11 @@ class BugInvestigationWorkflow:
 
         # ── Main loop ─────────────────────────────────────────────────────────
         while True:
+            # ── Dev takeover check (before close check) ───────────────────────
+            if self._dev_takeover:
+                await self._handle_dev_takeover(input)
+                return {"fix_type": "dev_takeover", "bug_id": input.bug_id}
+
             # ── Close check (reporter or dev sent close signal) ───────────────
             if self._close_requested:
                 await self._handle_close(input)
@@ -221,6 +254,7 @@ class BugInvestigationWorkflow:
                           investigation_dict.get("summary", "Resolved after dev review"), None],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
+                self._workspace_cleaned = True
                 await workflow.execute_activity(
                     cleanup_workspace, args=[input.bug_id],
                     start_to_close_timeout=timedelta(seconds=30),
@@ -270,10 +304,14 @@ class BugInvestigationWorkflow:
             # ── Always wait for dev feedback before looping ───────────────────
             self._state = WorkflowState.AWAITING_DEV
             dev_arrived = await workflow.wait_condition(
-                lambda: self._close_requested or len(self._message_queue) > 0,
+                lambda: self._close_requested or self._dev_takeover or len(self._message_queue) > 0,
                 timeout=timedelta(hours=48),
             )
             self._state = WorkflowState.INVESTIGATING
+
+            if self._dev_takeover:
+                await self._handle_dev_takeover(input)
+                return {"fix_type": "dev_takeover", "bug_id": input.bug_id}
 
             if self._close_requested:
                 await self._handle_close(input)
@@ -285,6 +323,7 @@ class BugInvestigationWorkflow:
                     update_bug_status, args=[input.bug_id, "resolved"],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
+                self._workspace_cleaned = True
                 await workflow.execute_activity(
                     cleanup_workspace, args=[input.bug_id],
                     start_to_close_timeout=timedelta(seconds=30),
@@ -333,7 +372,48 @@ class BugInvestigationWorkflow:
                   input.channel_id, "Bug closed on request", None],
             start_to_close_timeout=timedelta(seconds=10),
         )
+        self._workspace_cleaned = True
         await workflow.execute_activity(
             cleanup_workspace, args=[input.bug_id],
             start_to_close_timeout=timedelta(seconds=30),
         )
+
+    async def _handle_dev_takeover(self, input: BugReportInput) -> None:
+        """Record the assignee, set status to dev_takeover, and wait for a close signal."""
+        await workflow.execute_activity(
+            update_bug_assignee, args=[input.bug_id, self._takeover_user_id],
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        await workflow.execute_activity(
+            update_bug_status, args=[input.bug_id, WorkflowState.DEV_TAKEOVER.value],
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+        await workflow.execute_activity(
+            log_conversation_event,
+            args=[input.bug_id, "dev_takeover", "developer", self._takeover_user_id,
+                  None, f"Dev takeover by {self._takeover_user_id}", None],
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+        # Wait indefinitely for a close signal. Incoming dev messages are still
+        # logged via the incoming_message signal → DB path, but we don't feed
+        # them to Claude. 7-day timeout acts as a safety net.
+        self._state = WorkflowState.DEV_TAKEOVER
+        close_arrived = await workflow.wait_condition(
+            lambda: self._close_requested,
+            timeout=timedelta(days=7),
+        )
+
+        if close_arrived:
+            await self._handle_close(input)
+        else:
+            # 7-day safety-net timeout — auto-resolve
+            self._workspace_cleaned = True
+            await workflow.execute_activity(
+                update_bug_status, args=[input.bug_id, "resolved"],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            await workflow.execute_activity(
+                cleanup_workspace, args=[input.bug_id],
+                start_to_close_timeout=timedelta(seconds=30),
+            )

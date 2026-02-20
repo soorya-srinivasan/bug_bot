@@ -16,6 +16,13 @@ from bug_bot.agent.tools import build_custom_tools_server
 from bug_bot.agent.prompts import build_investigation_prompt, build_continuation_prompt
 from bug_bot.config import settings
 
+# Propagate the API key into os.environ so that ClaudeSDKClient (which spawns the
+# claude CLI as a subprocess) can pick it up.  Pydantic BaseSettings reads .env into
+# Python objects but does NOT write back to os.environ, so without this the subprocess
+# falls back to the subscription session instead of using the configured API key.
+if settings.anthropic_api_key:
+    os.environ.setdefault("ANTHROPIC_API_KEY", settings.anthropic_api_key)
+
 # Increase SDK initialize timeout to 120s — handles slow Bun startup on CPUs without AVX.
 # The env var is in milliseconds; the SDK enforces a 60s minimum so 120000 gives 120s.
 os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "120000")
@@ -126,6 +133,12 @@ def _build_options(resume: str | None = None, cwd: str = "/tmp/bugbot-workspace"
         system_prompt=_SYSTEM_PROMPT,
         output_format=_OUTPUT_SCHEMA,
         resume=resume,
+        sandbox={
+            "enabled": True,
+            "allowUnsandboxedCommands": False,  # Disable the escape hatch!
+            "allowedPaths": [cwd],
+            "deniedPaths": ["/home", "/root", "/etc", "/var", "/usr"]
+        }
     )
 
 

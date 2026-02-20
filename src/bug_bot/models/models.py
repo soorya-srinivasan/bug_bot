@@ -23,6 +23,7 @@ class BugReport(Base):
     severity: Mapped[str] = mapped_column(String(5), nullable=False, default="P3")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="new")
     temporal_workflow_id: Mapped[str | None] = mapped_column(String(100))
+    assignee_user_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
     attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

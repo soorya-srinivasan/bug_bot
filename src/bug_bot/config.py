@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     temporal_host: str = "localhost:7233"
     temporal_namespace: str = "default"
     temporal_task_queue: str = "bug-investigation"
+    # Auto-close
+    auto_close_inactivity_days: int = 1  # env: AUTO_CLOSE_INACTIVITY_DAYS
 
     # Anthropic
     anthropic_api_key: str = ""

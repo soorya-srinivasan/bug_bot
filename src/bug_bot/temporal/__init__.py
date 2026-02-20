@@ -6,6 +6,7 @@ class WorkflowState(str, Enum):
     INVESTIGATING = "investigating"
     AWAITING_REPORTER = "awaiting_reporter"
     AWAITING_DEV = "awaiting_dev"
+    DEV_TAKEOVER = "dev_takeover"
 
 
 @dataclass
