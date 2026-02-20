@@ -214,6 +214,20 @@ class BugRepository:
         await self.session.execute(stmt)
         await self.session.commit()
 
+    async def get_service_mappings_by_names(self, service_names: list[str]) -> list[ServiceTeamMapping]:
+        if not service_names:
+            return []
+        stmt = (
+            select(ServiceTeamMapping)
+            .outerjoin(Team, ServiceTeamMapping.team_id == Team.id)
+            .options(selectinload(ServiceTeamMapping.team))
+            .where(func.lower(ServiceTeamMapping.service_name).in_(
+                [s.lower() for s in service_names]
+            ))
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def get_service_mapping(self, service_name: str) -> ServiceTeamMapping | None:
         stmt = select(ServiceTeamMapping).where(ServiceTeamMapping.service_name == service_name)
         result = await self.session.execute(stmt)
@@ -364,11 +378,19 @@ class BugRepository:
             if not oncall:
                 oncall = mapping.primary_oncall
 
-            # Deduplicate by team or engineer
+            # Include service_owner for tagging fallback (oncall_engineer -> service_owner -> slack_group_id)
+            service_owner = mapping.service_owner
+
+            # Deduplicate by team or engineer. Always include all three keys (use None when missing)
+            # so Slack activity receives them and can apply priority: oncall_engineer > service_owner > slack_group_id.
             key = slack_group_id or oncall or ""
             if key and key not in seen:
                 seen.add(key)
-                entries.append({"oncall_engineer": oncall, "slack_group_id": slack_group_id})
+                entries.append({
+                    "oncall_engineer": oncall,
+                    "service_owner": service_owner,
+                    "slack_group_id": slack_group_id,
+                })
 
         return entries
 

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, date
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
@@ -6,12 +7,16 @@ from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
 from bug_bot.oncall import service as oncall_service
 from bug_bot.schemas.admin import (
+    BugConversationListResponse,
+    BugConversationResponse,
     BugFilters,
     BugListItem,
     BugUpdate,
     CurrentOnCallResponse,
     EscalationCreate,
     EscalationResponse,
+    InvestigationFindingListResponse,
+    InvestigationFindingResponse,
     InvestigationResponse,
     OnCallHistoryResponse,
     OnCallScheduleCreate,
@@ -26,6 +31,7 @@ from bug_bot.schemas.admin import (
     SLAConfigListResponse,
     SLAConfigResponse,
     SLAConfigUpdate,
+    TaggedOnEntry,
     TeamCreate,
     TeamResponse,
     TeamRotationConfigUpdate,
@@ -39,7 +45,9 @@ from bug_bot.schemas.admin import (
     SlackUserGroupListResponse,
     SlackUserGroupUsersRequest,
     SlackUserGroupUsersResponse,
+    SlackUsersLookupResponse,
 )
+from bug_bot.oncall.slack_notifications import get_user_info
 from bug_bot.slack.user_groups import list_user_groups, list_users_in_group
 
 
@@ -55,6 +63,33 @@ def _slack_message_url(channel_id: str, thread_ts: str) -> str:
 async def get_repo() -> BugRepository:
     async with async_session() as session:
         yield BugRepository(session)
+
+
+async def _resolve_tagged_on(
+    repo: BugRepository, relevant_services: list[str] | None,
+) -> list[TaggedOnEntry]:
+    if not relevant_services:
+        return []
+    mappings = await repo.get_service_mappings_by_names(relevant_services)
+    seen: set[str] = set()
+    entries: list[TaggedOnEntry] = []
+    for m in mappings:
+        oncall = None
+        if m.team and m.team.oncall_engineer:
+            oncall = m.team.oncall_engineer
+        if not oncall:
+            oncall = m.primary_oncall
+        service_owner = m.service_owner
+        slack_group_id = m.team.slack_group_id if m.team else None
+        key = oncall or service_owner or slack_group_id or ""
+        if key and key not in seen:
+            seen.add(key)
+            entries.append(TaggedOnEntry(
+                oncall_engineer=oncall,
+                service_owner=service_owner,
+                slack_group_id=slack_group_id,
+            ))
+    return entries
 
 
 def _validate_status_transition(current: str, new: str) -> None:
@@ -99,15 +134,45 @@ async def list_bugs(
         sort=sort,
     )
 
+    all_services: set[str] = set()
+    for _bug, inv in rows:
+        if inv and inv.relevant_services:
+            all_services.update(inv.relevant_services)
+
+    service_mappings = await repo.get_service_mappings_by_names(list(all_services)) if all_services else []
+    svc_map: dict[str, list] = {}
+    for m in service_mappings:
+        svc_map.setdefault(m.service_name.lower(), []).append(m)
+
     items: list[BugListItem] = []
     for bug, investigation in rows:
         investigation_summary = None
+        tagged_on: list[TaggedOnEntry] = []
         if investigation is not None:
             investigation_summary = {
                 "summary": investigation.summary,
                 "fix_type": investigation.fix_type,
                 "confidence": investigation.confidence,
             }
+            seen: set[str] = set()
+            for svc in (investigation.relevant_services or []):
+                for m in svc_map.get(svc.lower(), []):
+                    oncall = None
+                    if m.team and m.team.oncall_engineer:
+                        oncall = m.team.oncall_engineer
+                    if not oncall:
+                        oncall = m.primary_oncall
+                    service_owner = m.service_owner
+                    slack_group_id = m.team.slack_group_id if m.team else None
+                    key = oncall or service_owner or slack_group_id or ""
+                    if key and key not in seen:
+                        seen.add(key)
+                        tagged_on.append(TaggedOnEntry(
+                            oncall_engineer=oncall,
+                            service_owner=service_owner,
+                            slack_group_id=slack_group_id,
+                        ))
+
         items.append(
             BugListItem(
                 id=str(bug.id),
@@ -123,6 +188,7 @@ async def list_bugs(
                 updated_at=bug.updated_at,
                 resolved_at=bug.resolved_at,
                 investigation_summary=investigation_summary,
+                tagged_on=tagged_on,
             )
         )
 
@@ -136,12 +202,14 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
+    tagged_on: list[TaggedOnEntry] = []
     if investigation is not None:
         investigation_summary = {
             "summary": investigation.summary,
             "fix_type": investigation.fix_type,
             "confidence": investigation.confidence,
         }
+        tagged_on = await _resolve_tagged_on(repo, investigation.relevant_services)
     return BugListItem(
         id=str(bug.id),
         bug_id=bug.bug_id,
@@ -156,6 +224,7 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         updated_at=bug.updated_at,
         resolved_at=bug.resolved_at,
         investigation_summary=investigation_summary,
+        tagged_on=tagged_on,
     )
 
 
@@ -179,12 +248,14 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
 
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
+    tagged_on: list[TaggedOnEntry] = []
     if investigation is not None:
         investigation_summary = {
             "summary": investigation.summary,
             "fix_type": investigation.fix_type,
             "confidence": investigation.confidence,
         }
+        tagged_on = await _resolve_tagged_on(repo, investigation.relevant_services)
     return BugListItem(
         id=str(updated.id),
         bug_id=updated.bug_id,
@@ -199,6 +270,7 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         updated_at=updated.updated_at,
         resolved_at=updated.resolved_at,
         investigation_summary=investigation_summary,
+        tagged_on=tagged_on,
     )
 
 
@@ -250,6 +322,49 @@ async def create_escalation(
         reason=escalation.reason,
         created_at=escalation.created_at,
     )
+
+
+@router.get("/bugs/{bug_id}/conversations", response_model=BugConversationListResponse)
+async def get_bug_conversations(bug_id: str, repo: BugRepository = Depends(get_repo)):
+    bug = await repo.get_bug_by_id(bug_id)
+    if bug is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+    rows = await repo.get_conversations(bug_id)
+    items = [
+        BugConversationResponse(
+            id=str(c.id),
+            bug_id=c.bug_id,
+            channel=c.channel,
+            sender_type=c.sender_type,
+            sender_id=c.sender_id,
+            message_text=c.message_text,
+            message_type=c.message_type,
+            metadata=c.metadata_,
+            created_at=c.created_at,
+        )
+        for c in rows
+    ]
+    return BugConversationListResponse(items=items)
+
+
+@router.get("/bugs/{bug_id}/findings", response_model=InvestigationFindingListResponse)
+async def get_bug_findings(bug_id: str, repo: BugRepository = Depends(get_repo)):
+    bug = await repo.get_bug_by_id(bug_id)
+    if bug is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+    rows = await repo.get_findings_for_bug(bug_id)
+    items = [
+        InvestigationFindingResponse(
+            id=str(f.id),
+            bug_id=f.bug_id,
+            category=f.category,
+            finding=f.finding,
+            severity=f.severity,
+            created_at=f.created_at,
+        )
+        for f in rows
+    ]
+    return InvestigationFindingListResponse(items=items)
 
 
 @router.get("/sla-configs", response_model=SLAConfigListResponse)
@@ -988,4 +1103,51 @@ async def get_slack_user_group_users(
         user_ids=raw["user_ids"],
         users=users,
     )
+
+
+@router.get("/slack/users/lookup", response_model=SlackUsersLookupResponse)
+async def lookup_slack_users(
+    ids: str = Query(..., description="Comma-separated Slack user IDs"),
+):
+    """Batch-resolve Slack user IDs to display names."""
+    from bug_bot.oncall.slack_notifications import _get_slack_client, _slack_configured
+
+    user_ids = [uid.strip() for uid in ids.split(",") if uid.strip()]
+    if not user_ids:
+        return SlackUsersLookupResponse(users={}, team_id=None)
+
+    if not _slack_configured():
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Slack is not configured",
+        )
+
+    unique_ids = list(dict.fromkeys(user_ids))
+
+    results: dict[str, SlackUserDetail] = {}
+    infos = await asyncio.gather(
+        *(get_user_info(uid) for uid in unique_ids),
+        return_exceptions=True,
+    )
+    for uid, info in zip(unique_ids, infos):
+        if isinstance(info, dict) and info:
+            results[uid] = SlackUserDetail(
+                id=info["id"],
+                name=info.get("name"),
+                real_name=info.get("real_name"),
+                display_name=info.get("display_name"),
+                is_bot=info.get("is_bot", False),
+                deleted=info.get("deleted", False),
+            )
+
+    team_id: str | None = None
+    try:
+        client = _get_slack_client()
+        auth = await client.auth_test()
+        if auth.get("ok"):
+            team_id = auth.get("team_id")
+    except Exception:
+        pass
+
+    return SlackUsersLookupResponse(users=results, team_id=team_id)
 
