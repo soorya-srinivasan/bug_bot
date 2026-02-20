@@ -141,6 +141,82 @@ async def notify_oncall_assignment(
         return False
 
 
+async def send_nudge(
+    engineer_slack_id: str,
+    bug_id: str,
+    severity: str,
+    original_message: str,
+    slack_message_url: str | None = None,
+    summary: str | None = None,
+) -> bool:
+    """Send a Slack DM nudging an on-call engineer about a bug.
+
+    Returns True if the message was sent successfully, False otherwise.
+    """
+    if not _slack_configured():
+        return False
+
+    snippet = (original_message[:200] + "…") if len(original_message) > 200 else original_message
+
+    blocks: list[dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"👋 Nudge: {bug_id}", "emoji": True},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Severity:*\n{severity}"},
+                {"type": "mrkdwn", "text": f"*Bug ID:*\n{bug_id}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Report:*\n> {snippet}"},
+        },
+    ]
+
+    if summary:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Investigation summary:*\n{summary}"},
+        })
+
+    if slack_message_url:
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "View in Slack", "emoji": True},
+                    "url": slack_message_url,
+                    "action_id": "nudge_view_slack",
+                },
+            ],
+        })
+
+    fallback_text = f"Nudge: {bug_id} ({severity}) — {snippet}"
+
+    client = _get_slack_client()
+    try:
+        dm_response = await client.conversations_open(users=[engineer_slack_id])
+        if not dm_response.get("ok"):
+            return False
+
+        channel_id = dm_response.get("channel", {}).get("id")
+        if not channel_id:
+            return False
+
+        await client.chat_postMessage(
+            channel=channel_id,
+            text=fallback_text,
+            blocks=blocks,
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def notify_oncall_rotation(
     engineer_slack_id: str,
     group_name: str,

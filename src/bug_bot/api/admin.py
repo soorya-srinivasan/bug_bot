@@ -18,6 +18,7 @@ from bug_bot.schemas.admin import (
     InvestigationFindingListResponse,
     InvestigationFindingResponse,
     InvestigationResponse,
+    NudgeResponse,
     OnCallHistoryResponse,
     OnCallScheduleCreate,
     OnCallScheduleResponse,
@@ -47,7 +48,7 @@ from bug_bot.schemas.admin import (
     SlackUserGroupUsersResponse,
     SlackUsersLookupResponse,
 )
-from bug_bot.oncall.slack_notifications import get_user_info
+from bug_bot.oncall.slack_notifications import get_user_info, send_nudge
 from bug_bot.slack.user_groups import list_user_groups, list_users_in_group
 
 
@@ -324,6 +325,63 @@ async def create_escalation(
         escalated_to=escalation.escalated_to,
         reason=escalation.reason,
         created_at=escalation.created_at,
+    )
+
+
+@router.post("/bugs/{bug_id}/nudge", response_model=NudgeResponse)
+async def nudge_oncall(bug_id: str, repo: BugRepository = Depends(get_repo)):
+    """Send a Slack DM nudge to each tagged on-call engineer for this bug."""
+    bug = await repo.get_bug_by_id(bug_id)
+    if bug is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+
+    investigation = await repo.get_investigation(bug_id)
+    tagged_on = await _resolve_tagged_on(
+        repo, investigation.relevant_services if investigation else None,
+    )
+    if not tagged_on:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No on-call engineers tagged for this bug",
+        )
+
+    oncall_ids = list(dict.fromkeys(
+        uid
+        for entry in tagged_on
+        if (uid := entry.oncall_engineer or entry.service_owner)
+    ))
+    if not oncall_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No on-call engineers tagged for this bug",
+        )
+
+    slack_url = _slack_message_url(bug.slack_channel_id, bug.slack_thread_ts)
+    summary = investigation.summary if investigation else None
+
+    results = await asyncio.gather(
+        *(
+            send_nudge(
+                engineer_slack_id=uid,
+                bug_id=bug.bug_id,
+                severity=bug.severity,
+                original_message=bug.original_message,
+                slack_message_url=slack_url,
+                summary=summary,
+            )
+            for uid in oncall_ids
+        ),
+        return_exceptions=True,
+    )
+
+    nudged = [uid for uid, ok in zip(oncall_ids, results) if ok is True]
+    failed = [uid for uid, ok in zip(oncall_ids, results) if ok is not True]
+
+    return NudgeResponse(
+        bug_id=bug_id,
+        nudged_users=nudged,
+        failed_users=failed,
+        message=f"Nudged {len(nudged)} of {len(oncall_ids)} on-call engineer(s)",
     )
 
 

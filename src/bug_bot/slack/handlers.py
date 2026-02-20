@@ -1,6 +1,6 @@
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import anthropic
 from slack_bolt.async_app import AsyncApp
@@ -238,7 +238,7 @@ def register_handlers(app: AsyncApp):
 
         # ── Duplicate detection (feature flag) ────────────────────────────────
         if settings.enable_duplicate_detection:
-            dup_since = datetime.utcnow() - timedelta(hours=settings.duplicate_check_window_hours)
+            dup_since = datetime.now(timezone.utc) - timedelta(hours=settings.duplicate_check_window_hours)
             async with async_session() as _s:
                 recent_bugs = await BugRepository(_s).get_recent_open_bugs(since=dup_since)
             candidates = [
@@ -431,7 +431,7 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
             )
         else:
             # ── Rate limiting (only for non-close messages) ───────────────────
-            rate_window_start = datetime.utcnow() - timedelta(seconds=settings.reporter_reply_rate_window_secs)
+            rate_window_start = datetime.now(timezone.utc) - timedelta(seconds=settings.reporter_reply_rate_window_secs)
             async with async_session() as _s:
                 recent_count = await BugRepository(_s).count_recent_reporter_replies(
                     bug.bug_id, since=rate_window_start
