@@ -34,6 +34,34 @@ def format_investigation_result(result: dict, bug_id: str) -> list[dict]:
             }
         )
 
+    if result.get("grafana_logs_url"):
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":mag: *Logs:* <{result['grafana_logs_url']}|View in Grafana Loki>",
+                },
+            }
+        )
+
+    if result.get("culprit_commit"):
+        cc = result["culprit_commit"]
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f":git: *Culprit Commit:* `{cc.get('hash', 'unknown')}`\n"
+                        f"*Author:* {cc.get('author', 'unknown')} ({cc.get('email', '')})\n"
+                        f"*Date:* {cc.get('date', 'unknown')}\n"
+                        f"*Message:* _{cc.get('message', '')}_"
+                    ),
+                },
+            }
+        )
+
     if result.get("pr_url"):
         blocks.append(
             {
@@ -70,24 +98,19 @@ def format_summary_message(
         f"https://slack.com/archives/{original_channel}/p{original_thread_ts.replace('.', '')}"
     )
 
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*{bug_id}* | Severity: `{severity}` | Status: *{status}*\n"
-                    f"{result['summary']}\n"
-                    f"<{thread_link}|View original thread>"
-                ),
-            },
-        },
-    ]
+    text = (
+        f"*{bug_id}* | Severity: `{severity}` | Status: *{status}*\n"
+        f"{result['summary']}\n"
+        f"<{thread_link}|View original thread>"
+    )
+
+    if result.get("grafana_logs_url"):
+        text += f"\n:mag: <{result['grafana_logs_url']}|View logs in Grafana Loki>"
 
     if result.get("pr_url"):
-        blocks[0]["text"]["text"] += f"\n<{result['pr_url']}|View PR>"
+        text += f"\n:pr: <{result['pr_url']}|View PR>"
 
-    return blocks
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
 
 def format_triage_response(triage: dict, bug_id: str) -> str:
@@ -123,6 +146,18 @@ def format_investigation_as_markdown(result: dict, bug_id: str) -> str:
     ]
     if result.get("root_cause"):
         lines += ["## Root Cause", "", result["root_cause"], ""]
+    if result.get("grafana_logs_url"):
+        lines += ["## Logs", "", f"[View in Grafana Loki]({result['grafana_logs_url']})", ""]
+    if result.get("culprit_commit"):
+        cc = result["culprit_commit"]
+        lines += [
+            "## Culprit Commit",
+            "",
+            f"**Author:** {cc.get('author', 'unknown')} ({cc.get('email', '')})",
+            f"**Commit:** `{cc.get('hash', 'unknown')}` — {cc.get('message', '')}",
+            f"**Date:** {cc.get('date', 'unknown')}",
+            "",
+        ]
     if result.get("pr_url"):
         lines += ["## Pull Request", "", f"[View PR]({result['pr_url']})", ""]
     if result.get("recommended_actions"):
