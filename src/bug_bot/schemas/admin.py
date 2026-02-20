@@ -379,3 +379,76 @@ class NudgeResponse(BaseModel):
     failed_users: list[str]
     message: str
 
+
+# --- Dashboard Analytics ---
+
+
+class StatusCount(BaseModel):
+    status: str
+    count: int
+
+
+class SeverityCount(BaseModel):
+    severity: str
+    count: int
+
+
+class DailyBugCount(BaseModel):
+    date: date
+    created: int = 0
+    resolved: int = 0
+
+
+class SeverityResolution(BaseModel):
+    severity: str
+    avg_hours: float
+
+
+class FixTypeCount(BaseModel):
+    fix_type: str
+    count: int
+
+
+class ServiceBugCount(BaseModel):
+    service: str
+    count: int
+
+
+class CategoryCount(BaseModel):
+    category: str
+    count: int
+
+
+class FindingSeverityCount(BaseModel):
+    severity: str
+    count: int
+
+
+class RecentBugItem(BaseModel):
+    bug_id: str
+    severity: str
+    status: str
+    original_message: str
+    created_at: datetime
+
+
+class DashboardResponse(BaseModel):
+    total_bugs: int
+    open_bugs: int
+    resolved_bugs: int
+    avg_resolution_hours: float | None = None
+    escalation_rate: float = 0.0
+    avg_confidence: float | None = None
+    total_investigation_cost_usd: float = 0.0
+    avg_investigation_duration_ms: float | None = None
+
+    bugs_by_status: list[StatusCount] = []
+    bugs_by_severity: list[SeverityCount] = []
+    bug_trend: list[DailyBugCount] = []
+    avg_resolution_by_severity: list[SeverityResolution] = []
+    fix_type_distribution: list[FixTypeCount] = []
+    top_services: list[ServiceBugCount] = []
+    findings_by_category: list[CategoryCount] = []
+    findings_by_severity: list[FindingSeverityCount] = []
+    recent_bugs: list[RecentBugItem] = []
+

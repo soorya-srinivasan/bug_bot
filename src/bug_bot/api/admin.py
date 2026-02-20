@@ -13,6 +13,7 @@ from bug_bot.schemas.admin import (
     BugListItem,
     BugUpdate,
     CurrentOnCallResponse,
+    DashboardResponse,
     EscalationCreate,
     EscalationResponse,
     InvestigationFindingListResponse,
@@ -64,6 +65,13 @@ def _slack_message_url(channel_id: str, thread_ts: str) -> str:
 async def get_repo() -> BugRepository:
     async with async_session() as session:
         yield BugRepository(session)
+
+
+@router.get("/dashboard", response_model=DashboardResponse)
+async def get_dashboard(repo: BugRepository = Depends(get_repo)):
+    """Aggregated analytics for the dashboard page."""
+    stats = await repo.get_dashboard_stats()
+    return DashboardResponse(**stats)
 
 
 async def _resolve_tagged_on(
@@ -374,14 +382,28 @@ async def nudge_oncall(bug_id: str, repo: BugRepository = Depends(get_repo)):
         return_exceptions=True,
     )
 
-    nudged = [uid for uid, ok in zip(oncall_ids, results) if ok is True]
-    failed = [uid for uid, ok in zip(oncall_ids, results) if ok is not True]
+    nudged: list[str] = []
+    failed: list[str] = []
+    errors: list[str] = []
+    for uid, result in zip(oncall_ids, results):
+        if isinstance(result, Exception):
+            failed.append(uid)
+            errors.append(f"{uid}: {result}")
+        elif result is None:
+            nudged.append(uid)
+        else:
+            failed.append(uid)
+            errors.append(f"{uid}: {result}")
+
+    message = f"Nudged {len(nudged)} of {len(oncall_ids)} on-call engineer(s)"
+    if errors:
+        message += f" — {'; '.join(errors)}"
 
     return NudgeResponse(
         bug_id=bug_id,
         nudged_users=nudged,
         failed_users=failed,
-        message=f"Nudged {len(nudged)} of {len(oncall_ids)} on-call engineer(s)",
+        message=message,
     )
 
 
