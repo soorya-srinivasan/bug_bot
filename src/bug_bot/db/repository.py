@@ -44,6 +44,15 @@ class BugRepository:
         await self.session.refresh(report)
         return report
 
+    async def update_assignee(self, bug_id: str, user_id: str) -> None:
+        stmt = (
+            update(BugReport)
+            .where(BugReport.bug_id == bug_id)
+            .values(assignee_user_id=user_id, updated_at=datetime.utcnow())
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
     async def update_status(self, bug_id: str, status: str) -> None:
         stmt = (
             update(BugReport)
@@ -514,6 +523,31 @@ class BugRepository:
                 BugReport.status.not_in(["resolved"]),
             )
             .order_by(BugReport.created_at.desc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_stale_open_bugs(self, threshold: datetime) -> list[BugReport]:
+        """Open bugs whose last human interaction (or creation date) is before `threshold`.
+
+        Excludes 'resolved' and 'escalated' (SLA workflow owns escalated bugs).
+        """
+        last_human_sq = (
+            select(func.max(BugConversation.created_at))
+            .where(
+                BugConversation.bug_id == BugReport.bug_id,
+                BugConversation.sender_type.in_(["reporter", "developer"]),
+            )
+            .correlate(BugReport)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(BugReport)
+            .where(
+                BugReport.status.not_in(["resolved", "escalated"]),
+                func.coalesce(last_human_sq, BugReport.created_at) < threshold,
+            )
+            .order_by(BugReport.created_at)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

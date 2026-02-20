@@ -1,7 +1,17 @@
+from datetime import datetime, timedelta
+
 from temporalio import activity
 
 from bug_bot.db.session import async_session
 from bug_bot.db.repository import BugRepository
+
+
+@activity.defn
+async def update_bug_assignee(bug_id: str, user_id: str) -> None:
+    """Set the assignee (dev who took over) for a bug report."""
+    async with async_session() as session:
+        await BugRepository(session).update_assignee(bug_id, user_id)
+    activity.logger.info(f"Assignee for {bug_id} set to {user_id}")
 
 
 @activity.defn
@@ -78,3 +88,34 @@ async def log_conversation_event(
             sender_id=sender_id, channel=channel, message_text=message_text, metadata=metadata,
         )
     activity.logger.info(f"Conversation event logged for {bug_id}: type={message_type}")
+
+
+@activity.defn
+async def find_stale_bugs(inactivity_days: int) -> list[dict]:
+    """Return open bugs with no human interaction in the last inactivity_days days."""
+    threshold = datetime.utcnow() - timedelta(days=inactivity_days)
+    async with async_session() as session:
+        bugs = await BugRepository(session).get_stale_open_bugs(threshold)
+    activity.logger.info(f"Found {len(bugs)} stale bugs (threshold={threshold.date()})")
+    return [
+        {"bug_id": b.bug_id, "temporal_workflow_id": b.temporal_workflow_id, "status": b.status}
+        for b in bugs
+    ]
+
+
+@activity.defn
+async def mark_bug_auto_closed(bug_id: str) -> None:
+    """Resolve a bug directly and log the auto-close event (used when workflow is not running)."""
+    async with async_session() as session:
+        repo = BugRepository(session)
+        await repo.update_status(bug_id, "resolved")
+        await repo.log_conversation(
+            bug_id=bug_id,
+            message_type="resolved",
+            sender_type="system",
+            sender_id=None,
+            channel=None,
+            message_text="Auto-closed due to inactivity",
+            metadata={"reason": "auto_close_inactivity"},
+        )
+    activity.logger.info(f"Bug {bug_id} auto-closed (direct path)")

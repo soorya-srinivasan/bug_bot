@@ -2,6 +2,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
+import anthropic
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.web.async_client import AsyncWebClient
 
@@ -20,9 +21,79 @@ logger = logging.getLogger(__name__)
 
 _CLOSE_RE = re.compile(
     r'\b(close|cancel|nevermind|never mind|withdraw|ignore this|not an issue|'
-    r'already fixed|already resolved|issue is resolved|resolved now|no longer needed)\b',
+    r'already fixed|already resolved|issue is resolved|resolved now|no longer needed|'
+    r'disregard|forget it|drop this|closing this|no longer relevant|'
+    r'sorted|all good now|fixed now|done and done|no need|'
+    r'wont be needed|not needed anymore|no longer an issue)\b',
     re.IGNORECASE,
 )
+
+_TAKEOVER_RE = re.compile(
+    r'\b(take over|takeover|taking over|i will handle|i got this|i\'ll handle|'
+    r'let me handle|handling this|i\'ll take it|i am taking|taking this|'
+    r'i will look into|looking into this|i\'ll investigate|on it|i got it|'
+    r'leave it to me|i\'ll pick this up|picking this up|assigning to myself)\b',
+    re.IGNORECASE,
+)
+
+
+async def _is_workflow_active(handle) -> bool:
+    """Return True if the Temporal workflow is still running."""
+    try:
+        from temporalio.api.enums.v1 import WorkflowExecutionStatus
+        desc = await handle.describe()
+        return desc.status == WorkflowExecutionStatus.WORKFLOW_EXECUTION_STATUS_RUNNING
+    except Exception:
+        return False
+
+
+async def _is_takeover_intent(text: str) -> bool:
+    """Use a cheap LLM call to confirm the dev is explicitly claiming ownership of the bug."""
+    if not settings.anthropic_api_key:
+        return True
+    try:
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            system=(
+                "You determine whether a message is a developer explicitly claiming "
+                "ownership of a bug investigation (taking it over from the bot). "
+                "Reply with only 'yes' or 'no'."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        return response.content[0].text.strip().lower().startswith("yes")
+    except Exception:
+        logger.warning("Takeover-intent LLM check failed; falling back to regex result.")
+        return True
+
+
+async def _is_close_intent(text: str) -> bool:
+    """Use a cheap LLM call to confirm the user actually wants to close/cancel the bug.
+
+    _CLOSE_RE is a broad pre-filter; this second pass weeds out false positives
+    like "what is the closing time?" or "the issue is resolved in the new build?"
+    where the user is not requesting the bug to be closed.
+    """
+    if not settings.anthropic_api_key:
+        return True  # No key — fall back to regex result
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            system=(
+                "You determine whether a message is an explicit request to close or cancel a bug report. "
+                "Reply with only 'yes' or 'no'."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        return response.content[0].text.strip().lower().startswith("yes")
+    except Exception:
+        logger.warning("Close-intent LLM check failed; falling back to regex result.")
+        return True  # Fail open — better to close than to ignore a real request
 
 
 def _extract_text_from_blocks(blocks: list) -> str:
@@ -179,10 +250,16 @@ def register_handlers(app: AsyncApp):
                 dup_bug_id = dup["bug_id"]
                 async with async_session() as _s:
                     orig = await BugRepository(_s).get_bug_by_id(dup_bug_id)
-                thread_link = (
-                    f"slack://channel?team=&id={orig.slack_channel_id}&thread_ts={orig.slack_thread_ts}"
-                    if orig else ""
-                )
+                thread_link = ""
+                if orig:
+                    try:
+                        permalink_resp = await client.chat_getPermalink(
+                            channel=orig.slack_channel_id,
+                            message_ts=orig.slack_thread_ts,
+                        )
+                        thread_link = permalink_resp.get("permalink", "")
+                    except Exception:
+                        logger.warning("Could not fetch permalink for %s", dup_bug_id)
                 await client.chat_postMessage(
                     channel=channel_id,
                     thread_ts=thread_ts,
@@ -195,14 +272,6 @@ def register_handlers(app: AsyncApp):
                 )
                 return  # Do NOT insert to DB or start workflow
         severity = triage.get("severity", "P3")
-
-        # Acknowledge with triage info
-        ack_text = format_triage_response(triage, bug_id)
-        await client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=ack_text,
-        )
 
         # Save to DB with triaged severity
         async with async_session() as session:
@@ -227,9 +296,15 @@ def register_handlers(app: AsyncApp):
                 message_text=text,
             )
 
-        # Skip investigation for noise
+        # Skip investigation for noise — ack after DB insert succeeds
         if not triage.get("needs_investigation", True):
             logger.info("Triage says no investigation needed for %s", bug_id)
+            ack_text = format_triage_response(triage, bug_id)
+            await client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=ack_text,
+            )
             return
 
         # Start Temporal workflow
@@ -246,6 +321,14 @@ def register_handlers(app: AsyncApp):
             ),
             id=workflow_id,
             task_queue=settings.temporal_task_queue,
+        )
+
+        # Acknowledge only after both DB insert and workflow start succeed
+        ack_text = format_triage_response(triage, bug_id)
+        await client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=ack_text,
         )
 
     # Handle !resolve / !close commands in threads
@@ -321,29 +404,22 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
     if not bug.temporal_workflow_id or bug.status in ("resolved", "escalated"):
         return
 
-    # ── Rate limiting ─────────────────────────────────────────────────────────
-    rate_window_start = datetime.utcnow() - timedelta(seconds=settings.reporter_reply_rate_window_secs)
-    async with async_session() as _s:
-        recent_count = await BugRepository(_s).count_recent_reporter_replies(
-            bug.bug_id, since=rate_window_start
-        )
-    if recent_count >= settings.reporter_reply_rate_limit:
-        await client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=(
-                ":hourglass: We've received your previous messages and the investigation "
-                "is catching up. Please wait a moment before sending more updates."
-            ),
-        )
-        return
-
     temporal = await get_temporal_client()
     handle = temporal.get_workflow_handle(bug.temporal_workflow_id)
 
     try:
-        # ── Reporter wants to close the bug ──────────────────────────────────
-        if _CLOSE_RE.search(text):
+        # ── Reporter wants to close the bug (bypass rate limiting) ───────────
+        # Two-layer check: regex pre-filter → LLM intent confirmation.
+        if _CLOSE_RE.search(text) and await _is_close_intent(text):
+            async with async_session() as _s:
+                await BugRepository(_s).log_conversation(
+                    bug_id=bug.bug_id,
+                    message_type="resolved",
+                    sender_type="reporter",
+                    sender_id=event.get("user"),
+                    channel=channel_id,
+                    message_text=text,
+                )
             await handle.signal(BugInvestigationWorkflow.close_requested)
             await client.chat_postMessage(
                 channel=channel_id,
@@ -354,6 +430,23 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
                 ),
             )
         else:
+            # ── Rate limiting (only for non-close messages) ───────────────────
+            rate_window_start = datetime.utcnow() - timedelta(seconds=settings.reporter_reply_rate_window_secs)
+            async with async_session() as _s:
+                recent_count = await BugRepository(_s).count_recent_reporter_replies(
+                    bug.bug_id, since=rate_window_start
+                )
+            if recent_count >= settings.reporter_reply_rate_limit:
+                await client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=(
+                        ":hourglass: We've received your previous messages and the investigation "
+                        "is catching up. Please wait a moment before sending more updates."
+                    ),
+                )
+                return
+
             # ── Reporter message (clarification answer or additional context) ─
             # Persist to DB first so the agent can read it via get_bug_conversations
             # even mid-investigation. Signal carries only the conversation UUID.
@@ -415,8 +508,23 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
         handle = temporal.get_workflow_handle(bug.temporal_workflow_id)
 
         # ── Dev wants to close the bug ────────────────────────────────────────
-        if text and _CLOSE_RE.search(text):
-            await handle.signal(BugInvestigationWorkflow.close_requested)
+        if text and _CLOSE_RE.search(text) and await _is_close_intent(text):
+            active = await _is_workflow_active(handle)
+            if active:
+                await handle.signal(BugInvestigationWorkflow.close_requested)
+            else:
+                # Workflow already ended — update DB directly
+                async with async_session() as _s:
+                    repo = BugRepository(_s)
+                    await repo.update_status(bug.bug_id, "resolved")
+                    await repo.log_conversation(
+                        bug_id=bug.bug_id,
+                        message_type="resolved",
+                        sender_type="developer",
+                        sender_id=event.get("user"),
+                        channel=event["channel"],
+                        message_text=f"Closed by dev (workflow already ended): {text}",
+                    )
             # Ack in #bug-summaries — include the dev's reason so there's context.
             ack_text = f":white_check_mark: Got it — `{bug.bug_id}` will be closed.\n*Reason:* {text}"
             await client.chat_postMessage(
@@ -430,10 +538,10 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
             async with async_session() as _s:
                 inv = await BugRepository(_s).get_investigation(bug.bug_id)
             pr_url = inv.pr_url if inv else None
-            safe_reason = await redact_for_reporters(text)
+            # safe_reason = await redact_for_reporters(text)
             closure_text = (
-                f":white_check_mark: *{bug.bug_id}* has been marked as resolved.\n"
-                f"*Reason:* {safe_reason}"
+                f":white_check_mark: *{bug.bug_id}* has been marked as resolved by the team. If you think this as a mistake create a new report.\n"
+                # f"*Reason:* {safe_reason}"
             )
             if pr_url:
                 closure_text += f"\nA fix has been submitted: <{pr_url}|View PR>"
@@ -441,6 +549,41 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
                 channel=bug.slack_channel_id,
                 thread_ts=bug.slack_thread_ts,
                 text=closure_text,
+            )
+            return
+
+        # ── Dev takeover: bot @mentioned + takeover regex + LLM confirmation ──
+        bot_mentioned = (
+            settings.slack_bot_user_id and
+            f"<@{settings.slack_bot_user_id}>" in (text or "")
+        )
+        if bot_mentioned and _TAKEOVER_RE.search(text) and await _is_takeover_intent(text):
+            dev_user_id = event.get("user", "unknown")
+            async with async_session() as session:
+                await BugRepository(session).log_conversation(
+                    bug_id=bug.bug_id,
+                    message_type="dev_takeover",
+                    sender_type="developer",
+                    sender_id=dev_user_id,
+                    channel=event["channel"],
+                    message_text=text,
+                )
+            active = await _is_workflow_active(handle)
+            if active:
+                await handle.signal(BugInvestigationWorkflow.dev_takeover, args=[dev_user_id])
+            await client.chat_postMessage(
+                channel=event["channel"],
+                thread_ts=thread_ts,
+                text=(
+                    f":handshake: Got it — <@{dev_user_id}> is taking over `{bug.bug_id}`. "
+                    "Bot will stand by and skip further automated investigations. "
+                    "Send a close message when done."
+                ),
+            )
+            await client.chat_postMessage(
+                channel=bug.slack_channel_id,
+                thread_ts=bug.slack_thread_ts,
+                text=f":wave: A developer has taken over `{bug.bug_id}` and is handling it directly.",
             )
             return
 
