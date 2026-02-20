@@ -6,6 +6,7 @@ from bug_bot.temporal import BugReportInput, ParsedBug
 
 # Keyword -> service mapping (extend with your actual services)
 SERVICE_KEYWORDS = {
+    "payment-service": "payment-service",  # sample app demo service
     "payment": "Payment.API",
     "bill": "Bill.API",
     "invoice": "Bill.API",

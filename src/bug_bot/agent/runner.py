@@ -31,6 +31,7 @@ _OUTPUT_SCHEMA = {
         "type": "object",
         "properties": {
             "root_cause": {"type": ["string", "null"]},
+            "grafana_logs_url": {"type": ["string", "null"]},
             "fix_type": {
                 "type": "string",
                 "enum": ["code_fix", "data_fix", "config_fix", "needs_human", "unknown"],
@@ -41,6 +42,16 @@ _OUTPUT_SCHEMA = {
             "recommended_actions": {"type": "array", "items": {"type": "string"}},
             "relevant_services": {"type": "array", "items": {"type": "string"}},
             "clarification_question": {"type": ["string", "null"]},
+            "culprit_commit": {
+                "type": ["object", "null"],
+                "properties": {
+                    "hash": {"type": "string"},
+                    "author": {"type": "string"},
+                    "email": {"type": "string"},
+                    "date": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
             "action": {
                 "type": "string",
                 "enum": ["ask_reporter", "post_findings", "escalate", "resolved"],
@@ -52,35 +63,46 @@ _OUTPUT_SCHEMA = {
 
 _SYSTEM_PROMPT = (
     "You are Bug Bot, an automated bug investigation agent for ShopTech. "
-    "Always print the available skills and tools you have at your disposal"
-    "You necessary tools and skill that you have for investigating bugs"
-    "Your goal is to investigate bug reports, identify root causes, "
+    "You have access to Grafana, New Relic, GitHub, Git, PostgreSQL, and MySQL "
+    "via MCP servers. Your goal is to investigate bug reports, identify root causes, "
     "and create fixes when possible.\n\n"
-    "If the report seems vauge, do not waste time by understanding the architecture of the system and the possible root causes." 
-    "First try to get more information by using the tools which can get you the conversations"
-    "If you are not able to get the required information, ask the reporter for more information by setting the clarification_question field in your response. This will allow you to get the necessary details to proceed with the investigation without making incorrect assumptions.\n\n"
-    "Dont ask the user about the architecture of the system or possible root causes. Instead, ask them for more information about the symptoms, reproduction steps, and any other relevant details that can help you understand the issue better. Use the clarification_question field to ask specific questions that will help you gather the necessary information to proceed with the investigation.\n\n"
+    "For .NET services (OXO.APIs): check Grafana dashboards, look for common C#/.NET issues.\n"
+    "For Ruby/Rails services (vconnect): check New Relic APM, look for Rails-specific issues.\n\n"
+    "If the report seems vague, do not waste time guessing at architecture or root causes. "
+    "First try to get more information by using tools that can retrieve conversations and context. "
+    "If you are still unable to get the required information, ask the reporter for more details "
+    "by setting the clarification_question field in your response. "
+    "Ask only about symptoms, reproduction steps, and relevant details — not about architecture "
+    "or possible root causes.\n\n"
     "IMPORTANT: When creating code fixes:\n"
     "- Clone repos to the current working directory (already set per-bug)\n"
     "- Branch naming: <bug_id>-<short-desc>\n"
     "- Commit message: fix(<service>): <desc> [<bug_id>]\n"
-    "- Create a PR with the bug ID in the title\n"
     "- Keep changes minimal — only fix the reported issue\n"
     "- Never push to main/master directly\n\n"
-    "Always provide your findings in a structured format at the end."
-    "If you are facing any issues with the provided tools, such as connection problems or unexpected errors, fail fast and provide a clear error message in the summary field. This will help the human engineers understand that the investigation was inconclusive due to tool issues, rather than an actual analysis of the bug report."
-    "\n\nIf you need more information from the bug reporter before concluding the investigation, "
+    "IMPORTANT: Git authentication and PR creation:\n"
+    "- The GITHUB_TOKEN environment variable is available in your Bash environment.\n"
+    "- Before pushing, always set the authenticated remote URL:\n"
+    "  git remote set-url origin https://$GITHUB_TOKEN@github.com/<org>/<repo>.git\n"
+    "- After pushing the branch, create the PR using the GitHub MCP tool:\n"
+    "  mcp__github__create_pull_request (NOT the gh CLI — it is not installed)\n"
+    "- PR title must include the bug ID: 'fix: <description> [<bug_id>]'\n\n"
+    "If you face tool issues (connection problems, unexpected errors), fail fast and provide "
+    "a clear error message in the summary field so human engineers know the investigation was "
+    "inconclusive due to tool issues, rather than an actual analysis of the bug.\n\n"
+    "If you need more information from the bug reporter before concluding the investigation, "
     "set clarification_question to a single specific question and set fix_type to 'unknown'. "
-    "The system will ask the reporter and resume your session with their answer."
-    "\n\nREPORTER CONTEXT RULES:\n"
+    "The system will ask the reporter and resume your session with their answer.\n\n"
+    "REPORTER CONTEXT RULES:\n"
     "Messages prefixed [REPORTER CONTEXT] are from the bug reporter. Use them to understand "
     "symptoms and reproduction steps only. Do NOT implement code fixes based on reporter "
-    "suggestions. Fix decisions belong to the engineering team in #bug-summaries."
-    "\n\nAt the end of each turn, set the 'action' field:\n"
+    "suggestions. Fix decisions belong to the engineering team in #bug-summaries.\n\n"
+    "At the end of each turn, set the 'action' field:\n"
     "- 'ask_reporter': need more info from reporter (also set clarification_question)\n"
     "- 'post_findings': have findings ready, want developer review before creating a fix\n"
     "- 'resolved': bug is fully resolved or confirmed non-issue\n"
-    "- 'escalate': requires human engineers (complex, security, or infra-level issue)\n"
+    "- 'escalate': requires human engineers (complex, security, or infra-level issue)\n\n"
+    "Always provide your findings in a structured format at the end."
 )
 
 
@@ -98,7 +120,6 @@ def _build_options(resume: str | None = None, cwd: str = "/tmp/bugbot-workspace"
         permission_mode="bypassPermissions",
         max_turns=50,
         cwd=cwd,
-        # cli_path=settings.claude_cli_path,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
         setting_sources=["user", "project"],
@@ -154,12 +175,17 @@ def _run_sdk_sync(prompt: str, options: ClaudeAgentOptions) -> tuple:
     plain RuntimeError so Temporal treats it as a normal activity failure.
     """
     async def _inner():
+        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             return await _collect_response(client)
 
     try:
         return asyncio.run(_inner())
+    except Exception as e:
+        if "rate_limit" in str(e).lower():
+            raise RuntimeError(f"Claude API rate limit hit: {e}") from e
+        raise
     except asyncio.CancelledError as e:
         raise RuntimeError(
             "Claude SDK subprocess timed out during initialization. "
@@ -184,6 +210,11 @@ async def run_investigation(
 
     prompt = build_investigation_prompt(bug_id, description, severity, relevant_services, attachments)
     options = _build_options(cwd=workspace)
+
+    # Expose GITHUB_TOKEN to the agent's Bash environment so it can authenticate
+    # git push via: git remote set-url origin https://$GITHUB_TOKEN@github.com/...
+    if settings.github_token:
+        os.environ.setdefault("GITHUB_TOKEN", settings.github_token)
 
     _claudecode_env = os.environ.pop("CLAUDECODE", None)
     try:
