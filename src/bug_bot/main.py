@@ -48,7 +48,7 @@ app = FastAPI(title="Bug Bot", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8001", "http://localhost:8080", "http://localhost:8081"],
+    allow_origins=["http://localhost:8001", "http://localhost:8080", "http://localhost:8081", "http://localhost:8081"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

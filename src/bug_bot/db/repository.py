@@ -5,7 +5,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bug_bot.models.models import (
-    BugReport, BugConversation, Investigation, SLAConfig, Escalation,
+    BugReport, BugConversation, BugAuditLog, Investigation, SLAConfig, Escalation,
     ServiceTeamMapping, InvestigationFinding, InvestigationMessage,
     InvestigationFollowup, Team, OnCallSchedule, OnCallHistory
 )
@@ -133,6 +133,9 @@ class BugRepository:
         *,
         severity: str | None = None,
         status: str | None = None,
+        resolution_type: str | None = None,
+        closure_reason: str | None = None,
+        fix_provided: str | None = None,
     ) -> BugReport | None:
         values: dict = {"updated_at": datetime.now(timezone.utc)}
         if severity is not None:
@@ -141,6 +144,12 @@ class BugRepository:
             values["status"] = status
             if status == "resolved":
                 values["resolved_at"] = datetime.now(timezone.utc)
+        if resolution_type is not None:
+            values["resolution_type"] = resolution_type
+        if closure_reason is not None:
+            values["closure_reason"] = closure_reason
+        if fix_provided is not None:
+            values["fix_provided"] = fix_provided
 
         if len(values) == 1:  # only updated_at
             return await self.get_bug_by_id(bug_id)
@@ -154,6 +163,41 @@ class BugRepository:
         result = await self.session.execute(stmt)
         await self.session.commit()
         return result.scalar_one_or_none()
+
+    async def update_resolution_details(
+        self,
+        bug_id: str,
+        *,
+        resolution_type: str,
+        closure_reason: str,
+        fix_provided: str | None = None,
+    ) -> None:
+        values: dict = {
+            "resolution_type": resolution_type,
+            "closure_reason": closure_reason,
+            "updated_at": datetime.now(timezone.utc),
+        }
+        if fix_provided is not None:
+            values["fix_provided"] = fix_provided
+        stmt = (
+            update(BugReport)
+            .where(BugReport.bug_id == bug_id)
+            .values(**values)
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def has_pending_closure_request(self, bug_id: str) -> bool:
+        stmt = (
+            select(func.count())
+            .select_from(BugConversation)
+            .where(
+                BugConversation.bug_id == bug_id,
+                BugConversation.message_type == "closure_details_requested",
+            )
+        )
+        result = await self.session.execute(stmt)
+        return int(result.scalar_one()) > 0
 
     async def save_investigation(self, bug_id: str, result: dict) -> Investigation:
         conversation_history = result.get("conversation_history")
@@ -507,6 +551,29 @@ class BugRepository:
             .where(BugConversation.bug_id == bug_id)
             .order_by(BugConversation.created_at)
         )
+        return list(result.scalars().all())
+
+    async def create_audit_log(
+        self,
+        bug_id: str,
+        action: str,
+        source: str,
+        *,
+        performed_by: str | None = None,
+        payload: dict | None = None,
+        metadata: dict | None = None,
+    ) -> BugAuditLog:
+        entry = BugAuditLog(
+            bug_id=bug_id, action=action, source=source,
+            performed_by=performed_by, payload=payload, metadata_=metadata,
+        )
+        self.session.add(entry)
+        await self.session.commit()
+        return entry
+
+    async def get_audit_logs(self, bug_id: str) -> list[BugAuditLog]:
+        stmt = select(BugAuditLog).where(BugAuditLog.bug_id == bug_id).order_by(BugAuditLog.created_at)
+        result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def log_conversation(

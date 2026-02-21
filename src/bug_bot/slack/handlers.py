@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -94,6 +95,50 @@ async def _is_close_intent(text: str) -> bool:
     except Exception:
         logger.warning("Close-intent LLM check failed; falling back to regex result.")
         return True  # Fail open — better to close than to ignore a real request
+
+
+async def _extract_resolution_details(text: str) -> dict | None:
+    """Use a cheap LLM call to extract structured resolution data from a dev's close message.
+
+    Returns a dict with resolution_type, closure_reason, fix_provided (all nullable).
+    Returns None on failure.
+    """
+    if not settings.anthropic_api_key or not text.strip():
+        return None
+    try:
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=(
+                "You extract structured resolution details from a developer's message about closing/resolving a bug.\n"
+                "The message may contain a close command (like '@bugbot close this') followed by resolution details.\n"
+                "Look for:\n"
+                "- The type of fix: code_fix, data_fix, sre_fix, or not_a_valid_bug\n"
+                "- Why the bug is being closed (the reason/explanation)\n"
+                "- What specific fix was applied (PR link, config change, etc.)\n\n"
+                "Return ONLY a valid JSON object (no markdown fences, no extra text) with these fields:\n"
+                '{"resolution_type": "code_fix"|"data_fix"|"sre_fix"|"not_a_valid_bug"|null, '
+                '"closure_reason": "string or null", '
+                '"fix_provided": "string or null"}\n\n'
+                "If the message only says something like 'close this' with no details about the fix type or reason, "
+                "return all null values. Only extract what is explicitly stated or strongly implied."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if the model wraps the JSON
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            raw = raw.strip()
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            return None
+        return result
+    except Exception as e:
+        logger.warning("Resolution-details extraction failed: %s", e)
+        return None
 
 
 def _extract_text_from_blocks(blocks: list) -> str:
@@ -338,7 +383,55 @@ def register_handlers(app: AsyncApp):
             return
 
         thread_ts = event["thread_ts"]
+        channel_id = event["channel"]
         bug_id = f"BUG-{int(float(thread_ts))}"
+        raw_text = event.get("text", "")
+
+        # Strip the command prefix to get remaining text with potential details
+        detail_text = re.sub(r"^!(resolve|close|fixed)\s*", "", raw_text, flags=re.IGNORECASE).strip()
+
+        # Try to extract resolution details from any text after the command
+        details = await _extract_resolution_details(detail_text) if detail_text else None
+        res_type = details.get("resolution_type") if details else None
+        res_reason = details.get("closure_reason") if details else None
+        res_fix = details.get("fix_provided") if details else None
+
+        if not res_type or not res_reason:
+            # Missing details — ask and return without closing
+            missing = []
+            if not res_type:
+                missing.append("`resolution_type` (one of: `code_fix`, `data_fix`, `sre_fix`, `not_a_valid_bug`)")
+            if not res_reason:
+                missing.append("`closure_reason` (brief explanation of why this is being closed)")
+            await client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=(
+                    f":memo: Before I can close `{bug_id}`, I need a few more details:\n"
+                    + "\n".join(f"  - {m}" for m in missing)
+                    + "\n\nOptionally include `fix_provided` (e.g. PR link, config change)."
+                    "\n\nPlease reply with the details and I'll close the bug."
+                ),
+            )
+            async with async_session() as _s:
+                await BugRepository(_s).log_conversation(
+                    bug_id=bug_id,
+                    message_type="closure_details_requested",
+                    sender_type="bot",
+                    channel=channel_id,
+                    message_text="Requested resolution details before closure (via !resolve command)",
+                )
+            return
+
+        # Details present — save resolution details, then close
+        async with async_session() as session:
+            repo = BugRepository(session)
+            await repo.update_resolution_details(
+                bug_id,
+                resolution_type=res_type,
+                closure_reason=res_reason,
+                fix_provided=res_fix,
+            )
 
         temporal = await get_temporal_client()
         try:
@@ -352,10 +445,13 @@ def register_handlers(app: AsyncApp):
             repo = BugRepository(session)
             await repo.update_status(bug_id, "resolved")
 
+        res_summary = f"\n*Resolution:* {res_type} — {res_reason}"
+        if res_fix:
+            res_summary += f"\n*Fix:* {res_fix}"
         await client.chat_postMessage(
-            channel=event["channel"],
+            channel=channel_id,
             thread_ts=thread_ts,
-            text=":white_check_mark: Bug marked as resolved. SLA tracking stopped.",
+            text=f":white_check_mark: Bug marked as resolved. SLA tracking stopped.{res_summary}",
         )
 
 
@@ -416,13 +512,19 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
         )
         if bot_mentioned and _CLOSE_RE.search(text) and await _is_close_intent(text):
             async with async_session() as _s:
-                await BugRepository(_s).log_conversation(
+                _repo = BugRepository(_s)
+                await _repo.log_conversation(
                     bug_id=bug.bug_id,
                     message_type="resolved",
                     sender_type="reporter",
                     sender_id=event.get("user"),
                     channel=channel_id,
                     message_text=text,
+                )
+                await _repo.create_audit_log(
+                    bug_id=bug.bug_id, action="bug_closed", source="slack",
+                    performed_by=event.get("user"),
+                    payload={"previous_status": bug.status, "reason": "Closed by reporter via Slack"},
                 )
             await handle.signal(BugInvestigationWorkflow.close_requested)
             await client.chat_postMessage(
@@ -568,11 +670,67 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
 
         # ── Dev wants to close the bug ────────────────────────────────────────
         if bot_mentioned and text and _CLOSE_RE.search(text) and await _is_close_intent(text):
+            # Extract resolution details from the close message
+            details = await _extract_resolution_details(text)
+            print("DETAILS......................................")
+            print(details)
+            res_type = details.get("resolution_type") if details else None
+            res_reason = details.get("closure_reason") if details else None
+            res_fix = details.get("fix_provided") if details else None
+
+            if not res_type or not res_reason:
+                # Missing details — ask the dev and return without closing
+                missing = []
+                if not res_type:
+                    missing.append("`resolution_type` (one of: `code_fix`, `data_fix`, `sre_fix`, `not_a_valid_bug`)")
+                if not res_reason:
+                    missing.append("`closure_reason` (brief explanation of why this is being closed)")
+                await client.chat_postMessage(
+                    channel=event["channel"],
+                    thread_ts=thread_ts,
+                    text=(
+                        f":memo: Before I can close `{bug.bug_id}`, I need a few more details:\n"
+                        + "\n".join(f"  - {m}" for m in missing)
+                        + "\n\nOptionally include `fix_provided` (e.g. PR link, config change)."
+                        "\n\nPlease reply with the details and I'll close the bug."
+                    ),
+                )
+                async with async_session() as _s:
+                    await BugRepository(_s).log_conversation(
+                        bug_id=bug.bug_id,
+                        message_type="closure_details_requested",
+                        sender_type="bot",
+                        channel=event["channel"],
+                        message_text="Requested resolution details before closure",
+                    )
+                return
+
+            # Details present — save resolution details and proceed with closure
+            async with async_session() as _s:
+                _repo = BugRepository(_s)
+                await _repo.update_resolution_details(
+                    bug.bug_id,
+                    resolution_type=res_type,
+                    closure_reason=res_reason,
+                    fix_provided=res_fix,
+                )
+
             active = await _is_workflow_active(handle)
             if active:
+                async with async_session() as _s:
+                    await BugRepository(_s).create_audit_log(
+                        bug_id=bug.bug_id, action="bug_closed", source="slack",
+                        performed_by=event.get("user"),
+                        payload={
+                            "previous_status": bug.status,
+                            "reason": "Closed by dev via Slack (workflow active)",
+                            "resolution_type": res_type,
+                            "closure_reason": res_reason,
+                            "fix_provided": res_fix,
+                        },
+                    )
                 await handle.signal(BugInvestigationWorkflow.close_requested)
             else:
-                # Workflow already ended — update DB directly
                 async with async_session() as _s:
                     repo = BugRepository(_s)
                     await repo.update_status(bug.bug_id, "resolved")
@@ -584,18 +742,29 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
                         channel=event["channel"],
                         message_text=f"Closed by dev (workflow already ended): {text}",
                     )
-            # Ack in #bug-summaries — include the dev's reason so there's context.
-            ack_text = f":white_check_mark: Got it — `{bug.bug_id}` will be closed.\n*Reason:* {text}"
+                    await repo.create_audit_log(
+                        bug_id=bug.bug_id, action="bug_closed", source="slack",
+                        performed_by=event.get("user"),
+                        payload={
+                            "previous_status": bug.status,
+                            "reason": "Closed by dev via Slack (workflow ended)",
+                            "resolution_type": res_type,
+                            "closure_reason": res_reason,
+                            "fix_provided": res_fix,
+                        },
+                    )
+
+            res_summary = f"\n*Resolution:* {res_type} — {res_reason}"
+            if res_fix:
+                res_summary += f"\n*Fix:* {res_fix}"
+            ack_text = f":white_check_mark: Got it — `{bug.bug_id}` will be closed.{res_summary}"
             await client.chat_postMessage(
                 channel=event["channel"],
                 thread_ts=thread_ts,
                 text=ack_text,
             )
-            # Notify the reporter in the original #bug-reports thread.
-            # the reporter-facing channel; the summary channel keeps the original.
             closure_text = (
-                f":white_check_mark: *{bug.bug_id}* has been marked as resolved by the team. If you think this as a mistake create a new report.\n"
-                # f"*Reason:* {safe_reason}"
+                f":white_check_mark: *{bug.bug_id}* has been marked as resolved by the team. If you think this is a mistake create a new report.\n"
             )
             await client.chat_postMessage(
                 channel=bug.slack_channel_id,
@@ -604,17 +773,113 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
             )
             return
 
+        # ── Follow-up after bot asked for resolution details ──────────────────
+        if text and bug.status != "resolved":
+            async with async_session() as _s:
+                has_pending = await BugRepository(_s).has_pending_closure_request(bug.bug_id)
+            if has_pending:
+                details = await _extract_resolution_details(text)
+                res_type = details.get("resolution_type") if details else None
+                res_reason = details.get("closure_reason") if details else None
+                res_fix = details.get("fix_provided") if details else None
+
+                if not res_type or not res_reason:
+                    missing = []
+                    if not res_type:
+                        missing.append("`resolution_type` (one of: `code_fix`, `data_fix`, `sre_fix`, `not_a_valid_bug`)")
+                    if not res_reason:
+                        missing.append("`closure_reason` (brief explanation)")
+                    await client.chat_postMessage(
+                        channel=event["channel"],
+                        thread_ts=thread_ts,
+                        text=(
+                            f":memo: I still need the following to close `{bug.bug_id}`:\n"
+                            + "\n".join(f"  - {m}" for m in missing)
+                        ),
+                    )
+                    return
+
+                # Details now complete — save and close
+                async with async_session() as _s:
+                    _repo = BugRepository(_s)
+                    await _repo.update_resolution_details(
+                        bug.bug_id,
+                        resolution_type=res_type,
+                        closure_reason=res_reason,
+                        fix_provided=res_fix,
+                    )
+
+                active = await _is_workflow_active(handle)
+                if active:
+                    async with async_session() as _s:
+                        await BugRepository(_s).create_audit_log(
+                            bug_id=bug.bug_id, action="bug_closed", source="slack",
+                            performed_by=event.get("user"),
+                            payload={
+                                "previous_status": bug.status,
+                                "reason": "Closed by dev via Slack (follow-up details)",
+                                "resolution_type": res_type,
+                                "closure_reason": res_reason,
+                                "fix_provided": res_fix,
+                            },
+                        )
+                    await handle.signal(BugInvestigationWorkflow.close_requested)
+                else:
+                    async with async_session() as _s:
+                        repo = BugRepository(_s)
+                        await repo.update_status(bug.bug_id, "resolved")
+                        await repo.log_conversation(
+                            bug_id=bug.bug_id,
+                            message_type="resolved",
+                            sender_type="developer",
+                            sender_id=event.get("user"),
+                            channel=event["channel"],
+                            message_text=f"Closed by dev (follow-up details): {text}",
+                        )
+                        await repo.create_audit_log(
+                            bug_id=bug.bug_id, action="bug_closed", source="slack",
+                            performed_by=event.get("user"),
+                            payload={
+                                "previous_status": bug.status,
+                                "reason": "Closed by dev via Slack (follow-up, workflow ended)",
+                                "resolution_type": res_type,
+                                "closure_reason": res_reason,
+                                "fix_provided": res_fix,
+                            },
+                        )
+
+                res_summary = f"\n*Resolution:* {res_type} — {res_reason}"
+                if res_fix:
+                    res_summary += f"\n*Fix:* {res_fix}"
+                await client.chat_postMessage(
+                    channel=event["channel"],
+                    thread_ts=thread_ts,
+                    text=f":white_check_mark: Got it — `{bug.bug_id}` will be closed.{res_summary}",
+                )
+                await client.chat_postMessage(
+                    channel=bug.slack_channel_id,
+                    thread_ts=bug.slack_thread_ts,
+                    text=f":white_check_mark: *{bug.bug_id}* has been marked as resolved by the team. If you think this is a mistake create a new report.\n",
+                )
+                return
+
         # ── Dev takeover: bot @mentioned + takeover regex + LLM confirmation ──
         if bot_mentioned and _TAKEOVER_RE.search(text) and await _is_takeover_intent(text):
             dev_user_id = event.get("user", "unknown")
             async with async_session() as session:
-                await BugRepository(session).log_conversation(
+                _repo = BugRepository(session)
+                await _repo.log_conversation(
                     bug_id=bug.bug_id,
                     message_type="dev_takeover",
                     sender_type="developer",
                     sender_id=dev_user_id,
                     channel=event["channel"],
                     message_text=text,
+                )
+                await _repo.create_audit_log(
+                    bug_id=bug.bug_id, action="dev_takeover", source="slack",
+                    performed_by=dev_user_id,
+                    payload={"previous_status": bug.status},
                 )
             active = await _is_workflow_active(handle)
             if active:

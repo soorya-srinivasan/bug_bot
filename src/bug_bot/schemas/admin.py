@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, NonNegativeInt
 
 Severity = Literal["P1", "P2", "P3", "P4"]
 Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved", "dev_takeover", "pending_verification"]
+ResolutionType = Literal["code_fix", "data_fix", "sre_fix", "not_a_valid_bug"]
 
 
 class PaginationParams(BaseModel):
@@ -48,6 +49,9 @@ class BugListItem(BaseModel):
     updated_at: datetime
     resolved_at: datetime | None = None
     assignee_user_id: str | None = None
+    resolution_type: str | None = None
+    closure_reason: str | None = None
+    fix_provided: str | None = None
     investigation_summary: InvestigationSummary | None = None
     tagged_on: list[TaggedOnEntry] = []
     current_on_call: list[TaggedOnEntry] = []
@@ -63,6 +67,9 @@ class PaginatedBugs(BaseModel):
 class BugUpdate(BaseModel):
     severity: Severity | None = None
     status: Status | None = None
+    resolution_type: ResolutionType | None = None
+    closure_reason: str | None = None
+    fix_provided: str | None = None
 
 
 class InvestigationMessageResponse(BaseModel):
@@ -388,6 +395,22 @@ class BugConversationResponse(BaseModel):
 
 class BugConversationListResponse(BaseModel):
     items: list[BugConversationResponse]
+
+
+class AuditLogResponse(BaseModel):
+    id: str
+    bug_id: str
+    action: str
+    source: str
+    performed_by: str | None = None
+    payload: dict | None = None
+    metadata: dict | None = None
+    created_at: datetime
+
+
+class AuditLogListResponse(BaseModel):
+    items: list[AuditLogResponse]
+    total: int
 
 
 class InvestigationFindingResponse(BaseModel):

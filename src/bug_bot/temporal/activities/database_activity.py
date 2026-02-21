@@ -114,10 +114,30 @@ async def find_stale_bugs(inactivity_days: int) -> list[dict]:
 
 
 @activity.defn
+async def log_audit_event(
+    bug_id: str,
+    action: str,
+    source: str,
+    performed_by: str | None = None,
+    payload: dict | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Append an entry to the bug_audit_logs table."""
+    async with async_session() as session:
+        await BugRepository(session).create_audit_log(
+            bug_id=bug_id, action=action, source=source,
+            performed_by=performed_by, payload=payload, metadata=metadata,
+        )
+    activity.logger.info(f"Audit log created for {bug_id}: action={action}")
+
+
+@activity.defn
 async def mark_bug_auto_closed(bug_id: str) -> None:
     """Resolve a bug directly and log the auto-close event (used when workflow is not running)."""
     async with async_session() as session:
         repo = BugRepository(session)
+        bug = await repo.get_bug_by_id(bug_id)
+        previous_status = bug.status if bug else "unknown"
         await repo.update_status(bug_id, "resolved")
         await repo.log_conversation(
             bug_id=bug_id,
@@ -128,7 +148,30 @@ async def mark_bug_auto_closed(bug_id: str) -> None:
             message_text="Auto-closed due to inactivity",
             metadata={"reason": "auto_close_inactivity"},
         )
+        await repo.create_audit_log(
+            bug_id=bug_id, action="bug_closed", source="system",
+            payload={"previous_status": previous_status, "reason": "Auto-closed due to inactivity"},
+        )
     activity.logger.info(f"Bug {bug_id} auto-closed (direct path)")
+
+
+@activity.defn
+async def update_resolution_details(
+    bug_id: str,
+    resolution_type: str,
+    closure_reason: str,
+    fix_provided: str | None = None,
+) -> None:
+    """Set resolution tracking fields on a bug report."""
+    async with async_session() as session:
+        repo = BugRepository(session)
+        await repo.update_resolution_details(
+            bug_id,
+            resolution_type=resolution_type,
+            closure_reason=closure_reason,
+            fix_provided=fix_provided,
+        )
+    activity.logger.info(f"Resolution details saved for {bug_id}: type={resolution_type}")
 
 
 @activity.defn
