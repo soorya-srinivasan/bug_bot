@@ -96,6 +96,43 @@ async def get_dashboard(repo: BugRepository = Depends(get_repo)):
     return DashboardResponse(**stats)
 
 
+class TranslateRequest(BaseModel):
+    text: str
+
+
+class TranslateResponse(BaseModel):
+    translated_text: str
+
+
+@router.post("/translate", response_model=TranslateResponse)
+async def translate_text(payload: TranslateRequest):
+    """Translate text to English using Claude Haiku, preserving formatting."""
+    from bug_bot.config import settings
+    import anthropic
+
+    if not settings.anthropic_api_key:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Anthropic API key not configured")
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            system=(
+                "You are a translator. Translate the following text to English. "
+                "Preserve the original formatting, line breaks, spacing, and structure as much as possible. "
+                "If the text is already in English, return it unchanged. "
+                "Output ONLY the translated text, nothing else."
+            ),
+            messages=[{"role": "user", "content": payload.text}],
+        )
+        translated = response.content[0].text
+        return TranslateResponse(translated_text=translated)
+    except Exception:
+        logger.exception("Translation failed")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Translation failed")
+
+
 async def _resolve_tagged_on(
     repo: BugRepository,
     relevant_services: list[str] | None,
@@ -130,6 +167,7 @@ def _validate_status_transition(current: str, new: str) -> None:
         "awaiting_dev": {"escalated", "resolved"},
         "escalated": {"resolved"},
         "dev_takeover": {"resolved"},
+        "pending_verification": {"resolved"},
         "resolved": set(),
     }
     if current not in allowed or new not in allowed[current]:
@@ -137,6 +175,58 @@ def _validate_status_transition(current: str, new: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid status transition {current!r} -> {new!r}",
         )
+
+
+async def _notify_bug_closed_from_admin(bug, repo: BugRepository, payload) -> None:
+    """Post closure notifications to bug thread, summary thread, and stop SLA."""
+    from bug_bot.config import settings
+
+    slack_client = None
+    if settings.slack_bot_token:
+        from slack_sdk.web.async_client import AsyncWebClient
+        slack_client = AsyncWebClient(token=settings.slack_bot_token)
+
+    # Build closure message
+    parts = [f":white_check_mark: `{bug.bug_id}` has been closed via the admin panel."]
+    if payload.resolution_type:
+        parts.append(f"*Resolution:* {payload.resolution_type}")
+    if payload.closure_reason:
+        parts.append(f"*Reason:* {payload.closure_reason}")
+    if payload.fix_provided:
+        parts.append(f"*Fix:* {payload.fix_provided}")
+    closure_text = "\n".join(parts)
+
+    # 1. Post to bug thread
+    if slack_client and bug.slack_channel_id and bug.slack_thread_ts:
+        try:
+            await slack_client.chat_postMessage(
+                channel=bug.slack_channel_id,
+                thread_ts=bug.slack_thread_ts,
+                text=closure_text,
+            )
+        except Exception:
+            logger.warning("Failed to post closure message to bug thread for %s", bug.bug_id)
+
+    # 2. Post to summary thread
+    investigation = await repo.get_investigation(bug.bug_id)
+    if slack_client and investigation and investigation.summary_thread_ts and settings.bug_summaries_channel_id:
+        try:
+            await slack_client.chat_postMessage(
+                channel=settings.bug_summaries_channel_id,
+                thread_ts=investigation.summary_thread_ts,
+                text=closure_text,
+            )
+        except Exception:
+            logger.warning("Failed to post closure message to summary thread for %s", bug.bug_id)
+
+    # 3. Signal SLA workflow to stop tracking
+    try:
+        from bug_bot.temporal.client import get_temporal_client
+        temporal = await get_temporal_client()
+        handle = temporal.get_workflow_handle(f"sla-{bug.bug_id}")
+        await handle.signal("mark_resolved")
+    except Exception:
+        logger.debug("No SLA workflow to signal for %s (may not exist)", bug.bug_id)
 
 
 @router.get("/bugs", response_model=PaginatedBugs)
@@ -299,6 +389,9 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
             bug_id=bug_id, action="bug_closed", source="admin_panel",
             payload=audit_payload,
         )
+
+        # Notify Slack threads and stop SLA tracking
+        await _notify_bug_closed_from_admin(bug, repo, payload)
 
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
