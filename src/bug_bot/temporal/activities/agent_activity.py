@@ -82,6 +82,30 @@ async def run_agent_investigation(
         f"services={relevant_services}, attachments={len(attachments or [])})"
     )
 
+    if settings.mock_agent:
+        activity.logger.info(f"[MOCK] Returning static investigation result for {bug_id}")
+        await asyncio.sleep(2)
+        return {
+            "root_cause": f"Mock root cause for {bug_id}: simulated service degradation",
+            "fix_type": "needs_human",
+            "action": "escalate",
+            "pr_url": None,
+            "summary": (
+                f"[MOCK] Investigation of `{bug_id}` (severity {severity}). "
+                f"Services affected: {', '.join(relevant_services) or 'unknown'}. "
+                f"This is a mock response for testing — no real agent was invoked."
+            ),
+            "confidence": 0.75,
+            "recommended_actions": [
+                "Check service health dashboards",
+                "Review recent deployments",
+            ],
+            "relevant_services": relevant_services,
+            "claude_session_id": "mock-session-id",
+            "cost_usd": 0.0,
+            "duration_ms": 2000,
+        }
+
     # Download Slack attachments into the per-bug workspace before starting the agent
     if attachments:
         attachments = await _download_attachments(bug_id, attachments)
@@ -171,6 +195,46 @@ async def run_continuation_investigation(
         f"Starting continuation investigation for {bug_id} "
         f"(state={state}, new_messages={len(conversation_ids)}, session_id={claude_session_id})"
     )
+
+    if settings.mock_agent:
+        activity.logger.info(f"[MOCK] Returning static continuation result for {bug_id} (state={state})")
+        await asyncio.sleep(2)
+        if state == "awaiting_dev":
+            return {
+                "root_cause": f"Mock follow-up for {bug_id}",
+                "fix_type": "needs_human",
+                "action": "post_findings",
+                "pr_url": None,
+                "summary": (
+                    f"[MOCK] Follow-up for `{bug_id}`: Based on the developer's question, "
+                    f"the issue appears to be related to the service configuration. "
+                    f"This is a mock response for testing."
+                ),
+                "confidence": 0.8,
+                "recommended_actions": ["Review service config", "Check logs"],
+                "relevant_services": [],
+                "claude_session_id": claude_session_id or "mock-session-id",
+                "cost_usd": 0.0,
+                "duration_ms": 2000,
+            }
+        else:
+            return {
+                "root_cause": f"Mock continuation for {bug_id}",
+                "fix_type": "needs_human",
+                "action": "escalate",
+                "pr_url": None,
+                "summary": (
+                    f"[MOCK] Continuation for `{bug_id}`: After reviewing the reporter's "
+                    f"clarification, the issue requires human investigation. "
+                    f"This is a mock response for testing."
+                ),
+                "confidence": 0.7,
+                "recommended_actions": ["Escalate to on-call engineer"],
+                "relevant_services": [],
+                "claude_session_id": claude_session_id or "mock-session-id",
+                "cost_usd": 0.0,
+                "duration_ms": 2000,
+            }
 
     try:
         from bug_bot.agent.runner import run_continuation

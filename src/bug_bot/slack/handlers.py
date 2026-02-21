@@ -401,7 +401,7 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
     if event.get("user") != bug.reporter_user_id:
         return
 
-    if not bug.temporal_workflow_id or bug.status in ("resolved", "escalated"):
+    if not bug.temporal_workflow_id or bug.status in ("resolved",):
         return
 
     temporal = await get_temporal_client()
@@ -409,8 +409,12 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
 
     try:
         # ── Reporter wants to close the bug (bypass rate limiting) ───────────
-        # Two-layer check: regex pre-filter → LLM intent confirmation.
-        if _CLOSE_RE.search(text) and await _is_close_intent(text):
+        # Three-layer check: bot @mention → regex pre-filter → LLM intent confirmation.
+        bot_mentioned = (
+            settings.slack_bot_user_id
+            and f"<@{settings.slack_bot_user_id}>" in (text or "")
+        )
+        if bot_mentioned and _CLOSE_RE.search(text) and await _is_close_intent(text):
             async with async_session() as _s:
                 await BugRepository(_s).log_conversation(
                     bug_id=bug.bug_id,
@@ -429,6 +433,7 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
                     "Thanks for the update!"
                 ),
             )
+            return
         else:
             # ── Rate limiting (only for non-close messages) ───────────────────
             rate_window_start = datetime.now(timezone.utc) - timedelta(seconds=settings.reporter_reply_rate_window_secs)
@@ -447,9 +452,8 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
                 )
                 return
 
-            # ── Reporter message (clarification answer or additional context) ─
-            # Persist to DB first so the agent can read it via get_bug_conversations
-            # even mid-investigation. Signal carries only the conversation UUID.
+        # ── Escalated bugs: log reporter messages but don't trigger investigation
+        if bug.status == "escalated":
             reply_attachments = [
                 {
                     "id": f.get("id"),
@@ -463,9 +467,8 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
                 for f in event.get("files", [])
                 if f.get("url_private")
             ]
-            async with async_session() as session:
-                repo_log = BugRepository(session)
-                convo = await repo_log.log_conversation(
+            async with async_session() as _s:
+                await BugRepository(_s).log_conversation(
                     bug_id=bug.bug_id,
                     message_type="reporter_reply",
                     sender_type="reporter",
@@ -474,16 +477,67 @@ async def _handle_bug_thread_reply(event: dict, client: AsyncWebClient):
                     message_text=text,
                     metadata={"attachments": reply_attachments} if reply_attachments else None,
                 )
-                convo_id = str(convo.id)
-            await handle.signal(
-                BugInvestigationWorkflow.incoming_message,
-                args=["reporter", event.get("user", "unknown"), convo_id],
-            )
             await client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
-                text=":memo: Your response has been logged and the investigation will resume shortly.",
+                text=":memo: Your message has been logged. A developer is currently looking into this.",
             )
+            return
+
+        # ── Rate limiting (only for non-close messages) ───────────────────
+        rate_window_start = datetime.utcnow() - timedelta(seconds=settings.reporter_reply_rate_window_secs)
+        async with async_session() as _s:
+            recent_count = await BugRepository(_s).count_recent_reporter_replies(
+                bug.bug_id, since=rate_window_start
+            )
+        if recent_count >= settings.reporter_reply_rate_limit:
+            await client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=(
+                    ":hourglass: We've received your previous messages and the investigation "
+                    "is catching up. Please wait a moment before sending more updates."
+                ),
+            )
+            return
+
+        # ── Reporter message (clarification answer or additional context) ─
+        # Persist to DB first so the agent can read it via get_bug_conversations
+        # even mid-investigation. Signal carries only the conversation UUID.
+        reply_attachments = [
+            {
+                "id": f.get("id"),
+                "name": f.get("name"),
+                "mimetype": f.get("mimetype"),
+                "filetype": f.get("filetype"),
+                "size": f.get("size"),
+                "url_private": f.get("url_private"),
+                "permalink": f.get("permalink"),
+            }
+            for f in event.get("files", [])
+            if f.get("url_private")
+        ]
+        async with async_session() as session:
+            repo_log = BugRepository(session)
+            convo = await repo_log.log_conversation(
+                bug_id=bug.bug_id,
+                message_type="reporter_reply",
+                sender_type="reporter",
+                sender_id=event.get("user"),
+                channel=channel_id,
+                message_text=text,
+                metadata={"attachments": reply_attachments} if reply_attachments else None,
+            )
+            convo_id = str(convo.id)
+        await handle.signal(
+            BugInvestigationWorkflow.incoming_message,
+            args=["reporter", event.get("user", "unknown"), convo_id],
+        )
+        await client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=":memo: Your response has been logged and the investigation will resume shortly.",
+        )
     except Exception:
         logger.exception("Failed to signal workflow %s for %s", bug.temporal_workflow_id, bug.bug_id)
 
@@ -500,15 +554,20 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
     async with async_session() as session:
         repo = BugRepository(session)
         bug = await repo.get_bug_by_summary_thread_ts(thread_ts)
-        if not bug or not bug.temporal_workflow_id:
+        if not bug or not bug.temporal_workflow_id or bug.status in ("resolved",):
             return
 
     try:
         temporal = await get_temporal_client()
         handle = temporal.get_workflow_handle(bug.temporal_workflow_id)
 
+        bot_mentioned = (
+            settings.slack_bot_user_id
+            and f"<@{settings.slack_bot_user_id}>" in (text or "")
+        )
+
         # ── Dev wants to close the bug ────────────────────────────────────────
-        if text and _CLOSE_RE.search(text) and await _is_close_intent(text):
+        if bot_mentioned and text and _CLOSE_RE.search(text) and await _is_close_intent(text):
             active = await _is_workflow_active(handle)
             if active:
                 await handle.signal(BugInvestigationWorkflow.close_requested)
@@ -533,18 +592,11 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
                 text=ack_text,
             )
             # Notify the reporter in the original #bug-reports thread.
-            # Redact PII / sensitive org info from the reason before it reaches
             # the reporter-facing channel; the summary channel keeps the original.
-            async with async_session() as _s:
-                inv = await BugRepository(_s).get_investigation(bug.bug_id)
-            pr_url = inv.pr_url if inv else None
-            # safe_reason = await redact_for_reporters(text)
             closure_text = (
                 f":white_check_mark: *{bug.bug_id}* has been marked as resolved by the team. If you think this as a mistake create a new report.\n"
                 # f"*Reason:* {safe_reason}"
             )
-            if pr_url:
-                closure_text += f"\nA fix has been submitted: <{pr_url}|View PR>"
             await client.chat_postMessage(
                 channel=bug.slack_channel_id,
                 thread_ts=bug.slack_thread_ts,
@@ -553,10 +605,6 @@ async def _handle_summary_thread_reply(event: dict, client: AsyncWebClient):
             return
 
         # ── Dev takeover: bot @mentioned + takeover regex + LLM confirmation ──
-        bot_mentioned = (
-            settings.slack_bot_user_id and
-            f"<@{settings.slack_bot_user_id}>" in (text or "")
-        )
         if bot_mentioned and _TAKEOVER_RE.search(text) and await _is_takeover_intent(text):
             dev_user_id = event.get("user", "unknown")
             async with async_session() as session:

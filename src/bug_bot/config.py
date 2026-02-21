@@ -68,5 +68,9 @@ class Settings(BaseSettings):
 
     anthropic_log: str = "info"
 
+    # Testing: return static mock responses instead of invoking the Claude agent.
+    # Set MOCK_AGENT=true to skip real agent calls and speed up workflow testing.
+    mock_agent: bool = False
+
 
 settings = Settings()

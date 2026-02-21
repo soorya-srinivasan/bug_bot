@@ -121,3 +121,63 @@ claude --resume 9a9fab63-e2a7-4509-b71f-2c316b4d4a4c
 * Should not grep or look for files outside the current working dir
     * prepare allowlist for all tools and git commands and limited bash commands with in the cwd
     * Basically should be able to do anything within that cwd
+
+* Prompt to frequently check for get conversations tool call to get live context
+* Some sort of ratelimiting for customer followup input, to avoid context rot or poisoning
+* Check for recent open duplicate bug and auto close and link the duplicate bug and ask the user to create another one if truly distinct
+
+* logger not working in application server
+* Check if multiple workflow are able to run (multiple open bug reports)
+
+* anthropic api key not being used -> fixed
+* Duplicate thread link not working -> fixed to be tested
+* Ignore Ratelimiting for close requests -> fixed to be tested
+* Terminate the workflow, if bug is marked as closed but still some activity is running
+
+* Debug why workflow got closed prematurely on dev reply
+    * who is the current on call ->
+
+
+
+* Auto close scheduled job: -> done
+    which runs every 1 hour once and close the bugs which are in open state and without any interaction from both dev and reporter side in the last 5 (keep this configurable in env) days
+    Cleanup workspace created if present
+    Check if this can be implemented in temporal itself
+* Dev takeover -> done and tested
+* Fix the filtering part -> done
+* Only reply to slack after starting the workflow -> done
+
+
+* Guardrails and prompt tuning
+    * should not do anything outside the workspace
+    * should only clone the required codebases
+    * First check for vagueness and if the required bare minimum basic data are present, if not ask user instead of checking other things
+
+
+Prepapre a plan for a flow called dev takeover, 
+if the dev replies in the summary thread, tagging the bug agent, saying let me take over the bug or something similar,
+send a signal, which then passes further claude agent sdk invokations for investions, update the dev details in required tables as the one who took over or something or assignee kind of thing but still stores the conversations in the same existing flow in the slack event handlers.
+Do not close the workflow, close the workflow only when asked to close explicitly. And also on close event, check if the workflow is already in completed or terminated state, if yes
+just add a conversations log or an entry in some other suitable and update the status of the required tables to proper states if not done already,
+if the workflow is active, you can follow the smae existing flow. Ask clarifying questions if you have any doubt and do not assume things
+
+Oncall rotation -> scheduled job
+Fix bot scope
+On priority update, push slack message to bug reports
+On every edit, add to audit logs with action, payload and, performed by
+On dev reply, case is getting resolved-> check and fix it
+Sla -> Nudging workflow needs to be completed
+Ignore messages on a closed case
+
+Stop Guardrails -> only dev can ask to stop the investigation, that is take over
+or influence how investigation should be done, replies from bug reports are just information and should not instruct the agent on how to do things
+
+Remove category from triage -> done
+Formatting of questions -> done
+Ignore messages, if workflow resolved already -> done
+On call rotation
+
+Dev reply fix
+Test closure from both the threads
+Test dev take-over
+Remove periodic Nudging or fix it properly
