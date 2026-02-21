@@ -282,7 +282,7 @@ async def run_continuation(
     _claudecode_env = os.environ.pop("CLAUDECODE", None)
     try:
         loop = asyncio.get_event_loop()
-        result_data, total_cost, new_session_id, _ = await loop.run_in_executor(
+        result_data, total_cost, new_session_id, conversation_history = await loop.run_in_executor(
             _sdk_executor,
             lambda: _run_sdk_sync(prompt, options),
         )
@@ -307,6 +307,7 @@ async def run_continuation(
     result_data.setdefault("relevant_services", [])
     result_data.setdefault("recommended_actions", [])
     result_data.setdefault("action", "escalate")
+    result_data["conversation_history"] = conversation_history
     result_data["claude_session_id"] = new_session_id or claude_session_id
 
     return result_data

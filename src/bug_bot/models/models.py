@@ -55,7 +55,6 @@ class Investigation(Base):
     recommended_actions: Mapped[dict] = mapped_column(JSONB, default=list)
     cost_usd: Mapped[float | None] = mapped_column(Float)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
-    conversation_history: Mapped[dict | None] = mapped_column(JSONB)
     summary_thread_ts: Mapped[str | None] = mapped_column(String(30))
     claude_session_id: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -173,6 +172,52 @@ class InvestigationFinding(Base):
     __table_args__ = (
         Index("idx_investigation_findings_bug_id", "bug_id"),
         Index("idx_investigation_findings_category", "category"),
+    )
+
+
+class InvestigationMessage(Base):
+    __tablename__ = "investigation_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
+    investigation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("investigations.id"), nullable=True
+    )
+    followup_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("investigation_followups.id"), nullable=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    content: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_investigation_messages_bug_id", "bug_id"),
+        Index("idx_investigation_messages_investigation_id", "investigation_id"),
+        Index("idx_investigation_messages_followup_id", "followup_id"),
+    )
+
+
+class InvestigationFollowup(Base):
+    __tablename__ = "investigation_followups"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
+    trigger_state: Mapped[str] = mapped_column(String(20), nullable=False)
+    action: Mapped[str] = mapped_column(String(20), nullable=False)
+    fix_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    root_cause: Mapped[str | None] = mapped_column(Text)
+    pr_url: Mapped[str | None] = mapped_column(String(500))
+    recommended_actions: Mapped[dict] = mapped_column(JSONB, default=list)
+    relevant_services: Mapped[dict] = mapped_column(JSONB, default=list)
+    cost_usd: Mapped[float | None] = mapped_column(Float)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_investigation_followups_bug_id", "bug_id"),
     )
 
 

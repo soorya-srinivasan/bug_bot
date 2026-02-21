@@ -18,6 +18,9 @@ from bug_bot.schemas.admin import (
     EscalationResponse,
     InvestigationFindingListResponse,
     InvestigationFindingResponse,
+    InvestigationFollowupListResponse,
+    InvestigationFollowupResponse,
+    InvestigationMessageResponse,
     InvestigationResponse,
     NudgeResponse,
     OnCallHistoryResponse,
@@ -291,6 +294,36 @@ async def get_investigation(bug_id: str, repo: BugRepository = Depends(get_repo)
     investigation = await repo.get_investigation(bug_id)
     if investigation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found")
+    messages = await repo.get_investigation_messages(
+        bug_id, investigation_id=str(investigation.id),
+    )
+    followups = await repo.get_followup_investigations(bug_id)
+    followup_items = []
+    for f in followups:
+        f_messages = await repo.get_investigation_messages(bug_id, followup_id=str(f.id))
+        followup_items.append(InvestigationFollowupResponse(
+            id=str(f.id),
+            bug_id=f.bug_id,
+            trigger_state=f.trigger_state,
+            action=f.action,
+            fix_type=f.fix_type,
+            summary=f.summary,
+            confidence=f.confidence,
+            root_cause=f.root_cause,
+            pr_url=f.pr_url,
+            recommended_actions=f.recommended_actions or [],
+            relevant_services=f.relevant_services or [],
+            cost_usd=f.cost_usd,
+            duration_ms=f.duration_ms,
+            messages=[
+                InvestigationMessageResponse(
+                    id=str(m.id), sequence=m.sequence, message_type=m.message_type,
+                    content=m.content, created_at=m.created_at,
+                )
+                for m in f_messages
+            ],
+            created_at=f.created_at,
+        ))
     return InvestigationResponse(
         bug_id=bug_id,
         root_cause=investigation.root_cause,
@@ -302,7 +335,14 @@ async def get_investigation(bug_id: str, repo: BugRepository = Depends(get_repo)
         recommended_actions=investigation.recommended_actions or [],
         cost_usd=investigation.cost_usd,
         duration_ms=investigation.duration_ms,
-        conversation_history=investigation.conversation_history,
+        messages=[
+            InvestigationMessageResponse(
+                id=str(m.id), sequence=m.sequence, message_type=m.message_type,
+                content=m.content, created_at=m.created_at,
+            )
+            for m in messages
+        ],
+        followups=followup_items,
         summary_thread_ts=investigation.summary_thread_ts,
         created_at=investigation.created_at,
     )
@@ -448,6 +488,41 @@ async def get_bug_findings(bug_id: str, repo: BugRepository = Depends(get_repo))
         for f in rows
     ]
     return InvestigationFindingListResponse(items=items)
+
+
+@router.get("/bugs/{bug_id}/followups", response_model=InvestigationFollowupListResponse)
+async def get_bug_followups(bug_id: str, repo: BugRepository = Depends(get_repo)):
+    bug = await repo.get_bug_by_id(bug_id)
+    if bug is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+    followups = await repo.get_followup_investigations(bug_id)
+    items = []
+    for f in followups:
+        messages = await repo.get_investigation_messages(bug_id, followup_id=str(f.id))
+        items.append(InvestigationFollowupResponse(
+            id=str(f.id),
+            bug_id=f.bug_id,
+            trigger_state=f.trigger_state,
+            action=f.action,
+            fix_type=f.fix_type,
+            summary=f.summary,
+            confidence=f.confidence,
+            root_cause=f.root_cause,
+            pr_url=f.pr_url,
+            recommended_actions=f.recommended_actions or [],
+            relevant_services=f.relevant_services or [],
+            cost_usd=f.cost_usd,
+            duration_ms=f.duration_ms,
+            messages=[
+                InvestigationMessageResponse(
+                    id=str(m.id), sequence=m.sequence, message_type=m.message_type,
+                    content=m.content, created_at=m.created_at,
+                )
+                for m in messages
+            ],
+            created_at=f.created_at,
+        ))
+    return InvestigationFollowupListResponse(items=items)
 
 
 @router.get("/sla-configs", response_model=SLAConfigListResponse)

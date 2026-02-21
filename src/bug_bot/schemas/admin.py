@@ -1,11 +1,11 @@
 from datetime import datetime, date
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, NonNegativeInt
 
 
 Severity = Literal["P1", "P2", "P3", "P4"]
-Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved", "dev_takeover"]
+Status = Literal["new", "triaged", "investigating", "awaiting_dev", "escalated", "resolved", "dev_takeover", "pending_verification"]
 
 
 class PaginationParams(BaseModel):
@@ -64,6 +64,14 @@ class BugUpdate(BaseModel):
     status: Status | None = None
 
 
+class InvestigationMessageResponse(BaseModel):
+    id: str
+    sequence: int
+    message_type: str
+    content: str | None = None
+    created_at: datetime
+
+
 class InvestigationResponse(BaseModel):
     bug_id: str
     root_cause: str | None = None
@@ -75,9 +83,32 @@ class InvestigationResponse(BaseModel):
     recommended_actions: list[str] = []
     cost_usd: float | None = None
     duration_ms: int | None = None
-    conversation_history: Any = None
+    messages: list[InvestigationMessageResponse] = []
+    followups: list["InvestigationFollowupResponse"] = []
     summary_thread_ts: str | None = None
     created_at: datetime
+
+
+class InvestigationFollowupResponse(BaseModel):
+    id: str
+    bug_id: str
+    trigger_state: str
+    action: str
+    fix_type: str
+    summary: str
+    confidence: float
+    root_cause: str | None = None
+    pr_url: str | None = None
+    recommended_actions: list[str] = []
+    relevant_services: list[str] = []
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    messages: list[InvestigationMessageResponse] = []
+    created_at: datetime
+
+
+class InvestigationFollowupListResponse(BaseModel):
+    items: list[InvestigationFollowupResponse]
 
 
 class EscalationCreate(BaseModel):
