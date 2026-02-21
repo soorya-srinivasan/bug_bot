@@ -11,6 +11,8 @@ from bug_bot.oncall import service as oncall_service
 
 logger = logging.getLogger(__name__)
 from bug_bot.schemas.admin import (
+    AuditLogListResponse,
+    AuditLogResponse,
     BugConversationListResponse,
     BugConversationResponse,
     BugFilters,
@@ -184,6 +186,9 @@ async def list_bugs(
                 updated_at=bug.updated_at,
                 resolved_at=bug.resolved_at,
                 assignee_user_id=bug.assignee_user_id,
+                resolution_type=bug.resolution_type,
+                closure_reason=bug.closure_reason,
+                fix_provided=bug.fix_provided,
                 investigation_summary=investigation_summary,
                 tagged_on=tagged_on,
                 current_on_call=current_on_call,
@@ -229,6 +234,9 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         updated_at=bug.updated_at,
         resolved_at=bug.resolved_at,
         assignee_user_id=bug.assignee_user_id,
+        resolution_type=bug.resolution_type,
+        closure_reason=bug.closure_reason,
+        fix_provided=bug.fix_provided,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
         current_on_call=current_on_call,
@@ -241,6 +249,9 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
     if bug is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
 
+    old_severity = bug.severity
+    old_status = bug.status
+
     new_status = payload.status or bug.status
     if payload.status is not None:
         _validate_status_transition(bug.status, payload.status)
@@ -249,9 +260,31 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         bug_id,
         severity=payload.severity,
         status=new_status if payload.status is not None else None,
+        resolution_type=payload.resolution_type,
+        closure_reason=payload.closure_reason,
+        fix_provided=payload.fix_provided,
     )
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+
+    # Audit logging
+    if payload.severity is not None and payload.severity != old_severity:
+        await repo.create_audit_log(
+            bug_id=bug_id, action="priority_updated", source="admin_panel",
+            payload={"previous_severity": old_severity, "new_severity": payload.severity},
+        )
+    if payload.status == "resolved" and old_status != "resolved":
+        audit_payload: dict = {"previous_status": old_status, "reason": "Resolved via admin panel"}
+        if payload.resolution_type:
+            audit_payload["resolution_type"] = payload.resolution_type
+        if payload.closure_reason:
+            audit_payload["closure_reason"] = payload.closure_reason
+        if payload.fix_provided:
+            audit_payload["fix_provided"] = payload.fix_provided
+        await repo.create_audit_log(
+            bug_id=bug_id, action="bug_closed", source="admin_panel",
+            payload=audit_payload,
+        )
 
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
@@ -284,6 +317,9 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         updated_at=updated.updated_at,
         resolved_at=updated.resolved_at,
         assignee_user_id=updated.assignee_user_id,
+        resolution_type=updated.resolution_type,
+        closure_reason=updated.closure_reason,
+        fix_provided=updated.fix_provided,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
         current_on_call=current_on_call,
@@ -469,6 +505,28 @@ async def get_bug_conversations(bug_id: str, repo: BugRepository = Depends(get_r
         for c in rows
     ]
     return BugConversationListResponse(items=items)
+
+
+@router.get("/bugs/{bug_id}/audit-logs", response_model=AuditLogListResponse)
+async def get_bug_audit_logs(bug_id: str, repo: BugRepository = Depends(get_repo)):
+    bug = await repo.get_bug_by_id(bug_id)
+    if bug is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+    rows = await repo.get_audit_logs(bug_id)
+    items = [
+        AuditLogResponse(
+            id=str(a.id),
+            bug_id=a.bug_id,
+            action=a.action,
+            source=a.source,
+            performed_by=a.performed_by,
+            payload=a.payload,
+            metadata=a.metadata_,
+            created_at=a.created_at,
+        )
+        for a in rows
+    ]
+    return AuditLogListResponse(items=items, total=len(items))
 
 
 @router.get("/bugs/{bug_id}/findings", response_model=InvestigationFindingListResponse)

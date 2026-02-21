@@ -27,6 +27,7 @@ with workflow.unsafe.imports_passed_through():
         save_followup_result,
         store_summary_thread_ts,
         log_conversation_event,
+        log_audit_event,
         fetch_oncall_for_services,
     )
     from bug_bot.temporal.activities.agent_activity import (
@@ -364,6 +365,12 @@ class BugInvestigationWorkflow:
                     update_bug_status, args=[input.bug_id, "resolved"],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
+                await workflow.execute_activity(
+                    log_audit_event,
+                    args=[input.bug_id, "bug_closed", "system", None,
+                          {"reason": "Auto-resolved after 48-hour timeout"}, None],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
                 self._workspace_cleaned = True
                 await workflow.execute_activity(
                     cleanup_workspace, args=[input.bug_id],
@@ -450,6 +457,12 @@ class BugInvestigationWorkflow:
             self._workspace_cleaned = True
             await workflow.execute_activity(
                 update_bug_status, args=[input.bug_id, "resolved"],
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            await workflow.execute_activity(
+                log_audit_event,
+                args=[input.bug_id, "bug_closed", "system", None,
+                      {"reason": "Auto-resolved after 7-day dev takeover timeout"}, None],
                 start_to_close_timeout=timedelta(seconds=10),
             )
             await workflow.execute_activity(

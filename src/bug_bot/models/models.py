@@ -31,6 +31,9 @@ class BugReport(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    closure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fix_provided: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     investigation: Mapped["Investigation | None"] = relationship(back_populates="bug_report")
     escalations: Mapped[list["Escalation"]] = relationship(back_populates="bug_report")
@@ -39,6 +42,7 @@ class BugReport(Base):
         Index("idx_bug_reports_status", "status"),
         Index("idx_bug_reports_severity", "severity"),
         Index("idx_bug_reports_slack_thread_ts", "slack_thread_ts"),
+        Index("idx_bug_reports_resolution_type", "resolution_type"),
     )
 
 
@@ -155,6 +159,24 @@ class BugConversation(Base):
     __table_args__ = (
         Index("idx_bug_conversations_bug_id", "bug_id"),
         Index("idx_bug_conversations_message_type", "message_type"),
+    )
+
+
+class BugAuditLog(Base):
+    __tablename__ = "bug_audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
+    action: Mapped[str] = mapped_column(String(30), nullable=False)        # priority_updated | dev_takeover | bug_closed
+    source: Mapped[str] = mapped_column(String(20), nullable=False)        # admin_panel | slack | api | system
+    performed_by: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Slack user ID or None
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_bug_audit_logs_bug_id", "bug_id"),
+        Index("idx_bug_audit_logs_action", "action"),
     )
 
 
