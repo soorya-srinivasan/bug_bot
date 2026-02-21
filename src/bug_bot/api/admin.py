@@ -30,11 +30,14 @@ from bug_bot.schemas.admin import (
     InvestigationResponse,
     NudgeResponse,
     OnCallHistoryResponse,
+    OnCallOverrideCreate,
+    OnCallOverrideResponse,
     OnCallScheduleCreate,
     OnCallScheduleResponse,
     OnCallScheduleUpdate,
     PaginatedBugs,
     PaginatedOnCallHistory,
+    PaginatedOnCallOverrides,
     PaginatedOnCallSchedules,
     PaginatedTeams,
     PaginatedServiceTeamMappings,
@@ -866,10 +869,27 @@ async def update_team(
     payload: TeamUpdate,
     repo: BugRepository = Depends(get_repo),
 ):
+    old_team = await repo.get_team_by_id(id)
+    if old_team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+    old_oncall = old_team.oncall_engineer
+
     data = {k: v for k, v in payload.model_dump().items() if v is not None}
     t = await repo.update_team(id, data)
     if t is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    # Log history if oncall_engineer changed
+    if "oncall_engineer" in data and data["oncall_engineer"] != old_oncall:
+        await repo.log_oncall_change(
+            team_id=id,
+            engineer_slack_id=data["oncall_engineer"],
+            change_type="manual",
+            effective_date=date.today(),
+            previous_engineer_slack_id=old_oncall,
+            change_reason="Manual assignment via admin panel",
+        )
+
     return TeamResponse(
         id=str(t.id),
         slack_group_id=t.slack_group_id,
@@ -1165,6 +1185,153 @@ async def get_oncall_history(
         page=page,
         page_size=page_size,
     )
+
+
+# --- On-Call Overrides ---
+
+
+@router.post(
+    "/teams/{team_id}/oncall-overrides",
+    status_code=status.HTTP_201_CREATED,
+    response_model=OnCallOverrideResponse,
+)
+async def create_oncall_override(
+    team_id: str,
+    payload: OnCallOverrideCreate,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Create a date-specific on-call override for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    # Validate dates
+    if payload.end_date is not None and payload.end_date < payload.override_date:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="end_date must be on or after override_date",
+        )
+
+    # Check for overlapping overrides
+    has_overlap = await repo.check_override_overlap(
+        team_id, payload.override_date, payload.end_date
+    )
+    if has_overlap:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Override overlaps with an existing override for this team",
+        )
+
+    # Auto-populate original_engineer if not provided
+    original_engineer = payload.original_engineer_slack_id
+    if not original_engineer:
+        current = await oncall_service.get_current_oncall(repo, team_id, payload.override_date)
+        if current:
+            original_engineer = current.get("engineer_slack_id")
+
+    override = await repo.create_oncall_override(
+        team_id=team_id,
+        data={
+            "override_date": payload.override_date,
+            "end_date": payload.end_date,
+            "substitute_engineer_slack_id": payload.substitute_engineer_slack_id,
+            "original_engineer_slack_id": original_engineer,
+            "reason": payload.reason,
+            "created_by": "ADMIN",
+        },
+    )
+
+    # Log to history
+    await repo.log_oncall_change(
+        team_id=team_id,
+        engineer_slack_id=payload.substitute_engineer_slack_id,
+        change_type="override_created",
+        effective_date=payload.override_date,
+        previous_engineer_slack_id=original_engineer,
+        change_reason=payload.reason,
+    )
+
+    return OnCallOverrideResponse(
+        id=str(override.id),
+        team_id=str(override.team_id),
+        override_date=override.override_date,
+        end_date=override.end_date,
+        substitute_engineer_slack_id=override.substitute_engineer_slack_id,
+        original_engineer_slack_id=override.original_engineer_slack_id,
+        reason=override.reason,
+        created_by=override.created_by,
+        created_at=override.created_at,
+    )
+
+
+@router.get(
+    "/teams/{team_id}/oncall-overrides",
+    response_model=PaginatedOnCallOverrides,
+)
+async def list_oncall_overrides(
+    team_id: str,
+    repo: BugRepository = Depends(get_repo),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+):
+    """List on-call overrides for a team."""
+    team = await repo.get_team_by_id(team_id)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+
+    items, total = await repo.list_oncall_overrides(
+        team_id=team_id,
+        page=page,
+        page_size=page_size,
+    )
+    result_items = [
+        OnCallOverrideResponse(
+            id=str(o.id),
+            team_id=str(o.team_id),
+            override_date=o.override_date,
+            end_date=o.end_date,
+            substitute_engineer_slack_id=o.substitute_engineer_slack_id,
+            original_engineer_slack_id=o.original_engineer_slack_id,
+            reason=o.reason,
+            created_by=o.created_by,
+            created_at=o.created_at,
+        )
+        for o in items
+    ]
+    return PaginatedOnCallOverrides(
+        items=result_items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.delete(
+    "/teams/{team_id}/oncall-overrides/{override_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_oncall_override(
+    team_id: str,
+    override_id: str,
+    repo: BugRepository = Depends(get_repo),
+):
+    """Delete an on-call override."""
+    override = await repo.get_oncall_override_by_id(override_id)
+    if override is None or str(override.team_id) != team_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Override not found")
+    await repo.delete_oncall_override(override_id)
+
+    # Log to history
+    await repo.log_oncall_change(
+        team_id=team_id,
+        engineer_slack_id=override.substitute_engineer_slack_id,
+        change_type="override_deleted",
+        effective_date=override.override_date,
+        previous_engineer_slack_id=override.original_engineer_slack_id,
+        change_reason=f"Override deleted: {override.reason}",
+    )
+
+    return None
 
 
 @router.patch(

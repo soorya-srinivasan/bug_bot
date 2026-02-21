@@ -357,7 +357,7 @@ class OnCallHistoryResponse(BaseModel):
     team_id: str
     engineer_slack_id: str
     previous_engineer_slack_id: str | None = None
-    change_type: Literal["manual", "auto_rotation", "schedule_created", "schedule_updated", "schedule_deleted"]
+    change_type: Literal["manual", "auto_rotation", "schedule_created", "schedule_updated", "schedule_deleted", "override_created", "override_deleted"]
     change_reason: str | None = None
     effective_date: date
     changed_by: str | None = None
@@ -374,8 +374,38 @@ class PaginatedOnCallHistory(BaseModel):
 class CurrentOnCallResponse(BaseModel):
     engineer_slack_id: str | None
     effective_date: date | None
-    source: Literal["schedule", "rotation", "manual"] | None
+    source: Literal["schedule", "rotation", "manual", "override"] | None
     schedule_id: str | None = None
+
+
+# --- On-Call Overrides ---
+
+
+class OnCallOverrideCreate(BaseModel):
+    override_date: date
+    end_date: date | None = None
+    substitute_engineer_slack_id: str
+    original_engineer_slack_id: str | None = None
+    reason: str
+
+
+class OnCallOverrideResponse(BaseModel):
+    id: str
+    team_id: str
+    override_date: date
+    end_date: date | None
+    substitute_engineer_slack_id: str
+    original_engineer_slack_id: str | None
+    reason: str
+    created_by: str
+    created_at: datetime
+
+
+class PaginatedOnCallOverrides(BaseModel):
+    items: list[OnCallOverrideResponse]
+    total: NonNegativeInt
+    page: int
+    page_size: int
 
 
 # --- Bug Conversations & Findings ---

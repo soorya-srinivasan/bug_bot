@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bug_bot.models.models import (
     BugReport, BugConversation, BugAuditLog, Investigation, SLAConfig, Escalation,
     ServiceTeamMapping, InvestigationFinding, InvestigationMessage,
-    InvestigationFollowup, Team, OnCallSchedule, OnCallHistory
+    InvestigationFollowup, Team, OnCallSchedule, OnCallHistory, OnCallOverride
 )
 
 
@@ -795,13 +795,23 @@ class BugRepository:
     ) -> dict | None:
         """Get current on-call engineer for a team.
 
-        Checks active schedule first, then falls back to Team.oncall_engineer.
+        Priority: Override -> Schedule -> Team.oncall_engineer.
         Returns dict with engineer_slack_id, effective_date, source, schedule_id.
         """
         if check_date is None:
             check_date = date.today()
 
-        # Check for active schedule
+        # 1. Check for active override (highest priority)
+        override = await self.get_active_override_for_team(team_id, check_date)
+        if override:
+            return {
+                "engineer_slack_id": override.substitute_engineer_slack_id,
+                "effective_date": override.override_date,
+                "source": "override",
+                "schedule_id": None,
+            }
+
+        # 2. Check for active schedule
         stmt = (
             select(OnCallSchedule)
             .where(
@@ -958,6 +968,111 @@ class BugRepository:
         stmt = select(Team).where(Team.rotation_enabled == True)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    # ── On-Call Overrides ──────────────────────────────────────────────────────
+
+    async def get_active_override_for_team(
+        self, team_id: str, check_date: date | None = None
+    ) -> OnCallOverride | None:
+        """Get active override for a team on a specific date."""
+        if check_date is None:
+            check_date = date.today()
+        stmt = (
+            select(OnCallOverride)
+            .where(
+                OnCallOverride.team_id == team_id,  # type: ignore[arg-type]
+                OnCallOverride.override_date <= check_date,
+                or_(
+                    # Single-day override: end_date is NULL and override_date matches
+                    and_(
+                        OnCallOverride.end_date.is_(None),
+                        OnCallOverride.override_date == check_date,
+                    ),
+                    # Multi-day override: end_date >= check_date
+                    OnCallOverride.end_date >= check_date,
+                ),
+            )
+            .order_by(desc(OnCallOverride.created_at))
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def create_oncall_override(
+        self, team_id: str, data: dict
+    ) -> OnCallOverride:
+        override = OnCallOverride(team_id=team_id, **data)
+        self.session.add(override)
+        await self.session.commit()
+        await self.session.refresh(override)
+        return override
+
+    async def list_oncall_overrides(
+        self,
+        team_id: str,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[OnCallOverride], int]:
+        stmt: Select = select(OnCallOverride).where(
+            OnCallOverride.team_id == team_id  # type: ignore[arg-type]
+        )
+        total = await self.session.execute(
+            stmt.with_only_columns(func.count()).order_by(None)
+        )
+        total_count = int(total.scalar_one())
+        offset = (page - 1) * page_size
+        stmt = (
+            stmt.order_by(desc(OnCallOverride.override_date))
+            .offset(offset)
+            .limit(page_size)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total_count
+
+    async def get_oncall_override_by_id(self, id_: str) -> OnCallOverride | None:
+        stmt = select(OnCallOverride).where(OnCallOverride.id == id_)  # type: ignore[arg-type]
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def delete_oncall_override(self, id_: str) -> OnCallOverride | None:
+        override = await self.get_oncall_override_by_id(id_)
+        if override is None:
+            return None
+        await self.session.delete(override)
+        await self.session.commit()
+        return override
+
+    async def check_override_overlap(
+        self,
+        team_id: str,
+        override_date: date,
+        end_date: date | None = None,
+        exclude_id: str | None = None,
+    ) -> bool:
+        """Check if an override overlaps with existing overrides for the team."""
+        effective_end = end_date if end_date is not None else override_date
+        stmt = select(OnCallOverride).where(
+            OnCallOverride.team_id == team_id,  # type: ignore[arg-type]
+            or_(
+                # Existing single-day overlaps with new range
+                and_(
+                    OnCallOverride.end_date.is_(None),
+                    OnCallOverride.override_date >= override_date,
+                    OnCallOverride.override_date <= effective_end,
+                ),
+                # Existing multi-day overlaps with new range
+                and_(
+                    OnCallOverride.end_date.is_not(None),
+                    OnCallOverride.override_date <= effective_end,
+                    OnCallOverride.end_date >= override_date,
+                ),
+            ),
+        )
+        if exclude_id:
+            stmt = stmt.where(OnCallOverride.id != exclude_id)  # type: ignore[arg-type]
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is not None
 
     # ── Dashboard Analytics ──────────────────────────────────────────────────
 
