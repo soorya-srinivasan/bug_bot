@@ -2,6 +2,9 @@
 
 Use this guide to query logs from Grafana (Loki) for a specific service and time window.
 
+> **GUARDRAIL**: Logs must ONLY be queried via `mcp__bugbot_tools__query_loki_logs`.
+> Do NOT read log files from the local filesystem using Read, Bash, or Grep.
+
 ## Grafana / Loki
 
 ### Basic log query structure (LogQL)
