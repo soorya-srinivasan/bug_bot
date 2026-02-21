@@ -80,7 +80,11 @@ def build_investigation_prompt(
 ## Investigation Steps
 Follow these steps in order:
 
-1. **Observability — Grafana Loki (MANDATORY FIRST STEP)**
+> **GUARDRAIL**: All data must come from Grafana/Loki or GitHub MCP tools only.
+> Do NOT use Read, Glob, Grep, or Bash to access system files during investigation.
+> The local workspace is reserved exclusively for writing and committing code fixes.
+
+1. **Observability — Grafana Loki (MANDATORY FIRST STEP)** *(skill: logs_reading.md)*
    Grafana is running at http://localhost:3000 and Loki at http://localhost:3100.
    You MUST query Loki before doing anything else.
 
@@ -109,39 +113,44 @@ Follow these steps in order:
         `http://localhost:3000/explore?orgId=1&left=%7B"datasource":"<UID>","queries":%5B%7B"expr":"<URL-encoded LogQL>","refId":"A"%7D%5D,"range":%7B"from":"now-1h","to":"now"%7D%7D`
         Set this URL in the `grafana_logs_url` field of your response.
 
-2. **Code Search** — Call `mcp__bugbot_tools__list_services` early to get all canonical service
-   names. If the bug mentions any term that matches a service's name or description, include that
-   service in your investigation even if it wasn't explicitly named. When multiple services could
-   be involved, investigate all of them.
+2. **Code Search** *(skill: service_team_fetching.md)* — Call `mcp__bugbot_tools__list_services`
+   early to get all canonical service names. If the bug mentions any term that matches a service's
+   name or description, include that service in your investigation even if it wasn't explicitly named.
+   When multiple services could be involved, investigate all of them.
    Use `mcp__bugbot_tools__lookup_service_owner` to find the GitHub repo for each affected service.
    Then use `mcp__github__search_code` or `mcp__github__get_file_contents` to locate the function
    or file mentioned in the error traceback from the logs.
+   Do NOT clone the repo — all code reading must go through GitHub MCP tools.
 
-3. **Code Analysis** — Use `mcp__git__clone_repository` to clone the repo to
-   `/tmp/bugbot-workspace/<repo-name>`. Read the specific file and function from the traceback.
+3. **Code Analysis** *(skill: dotnet_debugging.md or rails_debugging.md)* — Use
+   `mcp__github__get_file_contents` to read the specific file and function from the traceback.
    Look for: unguarded division, missing null/zero checks, missing error handling.
    Then identify the commit that introduced the bug:
-   - Run `git blame -L <start>,<end> <file>` on the affected lines to find the commit hash and author.
-   - Run `git show <hash> --stat` to confirm the change and get the full author name, email, and date.
+   - Use `mcp__github__list_commits` with the file path to find recent commits touching the file.
+   - Use `mcp__github__get_commit` on the suspect commit hash to confirm the change and get the
+     full author name, email, and date.
    - Record: commit hash (short), author name, author email, commit date, and commit message.
    Include this in the PR body as: `Introduced by: <author> (<email>) in <hash> on <date>: "<message>"`
 
-4. **Data Check** — If the bug appears data-related (not a code bug), use `mcp__postgres__*` or
-   `mcp__mysql__*` to run READ-ONLY queries (SELECT only, always LIMIT results) to check for
-   data inconsistencies or unexpected values.
+4. **Data Check** *(skill: database_investigation.md)* — If the bug appears data-related (not a
+   code bug), use `mcp__postgres__*` or `mcp__mysql__*` to run READ-ONLY queries (SELECT only,
+   always LIMIT results) to check for data inconsistencies or unexpected values.
 
-5. **Root Cause** — Synthesize findings into a root cause assessment with a confidence level (0.0–1.0).
+5. **Root Cause** *(skill: plan.md)* — Synthesize findings into a root cause assessment with a confidence level (0.0–1.0).
 
-6. **Action — choose based on root cause:**
+6. **Action — choose based on root cause:** *(skill: pr_execution.md if code fix)*
 
    **IF root cause is a CODE BUG and confidence > 0.8:**
    - Use `mcp__git__create_branch` to create a branch: `<bug_id>-<short-desc>`
    - Make the minimal fix (add a guard clause only — do not refactor surrounding code)
    - Use `mcp__git__commit` with message: `fix(<service>): <description> [<bug_id>]`
    - Use `mcp__git__push` to push the branch
-   - Use `mcp__github__create_pull_request` to open a PR
-     - PR title must include the bug ID: `fix: <description> [<bug_id>]`
-     - PR body must include a "Culprit Commit" section:
+   - Use `mcp__github__create_pull_request` to open the PR (do NOT use Bash or gh CLI for this):
+     - repo: `<org>/<repo>`
+     - title: `fix: <description> [<bug_id>]`
+     - head: `<branch-name>`
+     - base: `main` (or `master` — check what the repo default branch is)
+     - body must include a "Culprit Commit" section:
        ```
        ## Culprit Commit
        Introduced by **<author name>** (<author email>)
@@ -167,9 +176,15 @@ Follow these steps in order:
 
 ## Important
 - All database access is READ-ONLY. Do not attempt writes.
+- All code access must go through GitHub MCP (`mcp__github__*`). Do not clone repos or read
+  local files for investigation — use `mcp__github__get_file_contents` and `mcp__github__search_code`.
+- All log access must go through Grafana/Loki (`mcp__bugbot_tools__query_loki_logs`). Do not
+  read log files from the local filesystem.
 - Call `list_services` early in your investigation to get all canonical service names.
   Use ONLY those exact names in the `relevant_services` field of your output — this
   ensures the right on-call engineers are paged on escalation.
 - Use `lookup_service_owner` with the canonical name to get repo and team info.
 - Use the `report_finding` tool to log significant observations during investigation.
+- Populate `skills_used` in your output with every skill file you consulted during this
+  investigation (e.g. `["plan.md", "logs_reading.md", "service_team_fetching.md"]`).
 - Be thorough but time-efficient. Focus on the most likely causes first."""

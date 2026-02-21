@@ -5,19 +5,25 @@ def build_mcp_servers() -> dict:
     """Build MCP server configurations for Claude Agent SDK."""
     servers = {}
 
-    # # GitHub (official Anthropic MCP server)
-    # if settings.github_token:
-    #     servers["github"] = {
-    #         "command": "npx",
-    #         "args": ["-y", "@anthropic-ai/mcp-server-github"],
-    #         "env": {"GITHUB_TOKEN": settings.github_token},
-    #     }
+    # GitHub MCP server — handles ALL repository operations via the GitHub API:
+    # branch creation, file reads, file commits (create_or_update_file / push_files),
+    # and PR creation.  No local git clone or Bash git commands are needed.
+    # Package: @modelcontextprotocol/server-github (npm, confirmed valid)
+    if settings.github_token:
+        servers["github"] = {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github"],
+            # @modelcontextprotocol/server-github reads GITHUB_PERSONAL_ACCESS_TOKEN,
+            # not GITHUB_TOKEN.  Using the wrong var leaves every request unauthenticated:
+            # public reads succeed, but any write (create_branch, push_files, create_pull_request)
+            # returns HTTP 401 / GitHubAuthenticationError.
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": settings.github_token},
+        }
 
-    # # Git (official Anthropic MCP server)
-    # servers["git"] = {
-    #     "command": "npx",
-    #     "args": ["-y", "@anthropic-ai/mcp-server-git"],
-    # }
+    # NOTE: mcp-server-git (uvx) was removed.
+    # @modelcontextprotocol/server-git has no git_clone or git_push tools, making it
+    # unusable for the full PR workflow.  All git operations now go through the
+    # GitHub MCP server above (API-based, no local filesystem required).
 
     # Grafana MCP via npx is disabled — @grafana/mcp-grafana does not exist on npm.
     # Loki and Grafana are queried directly via the bugbot_tools custom MCP server
