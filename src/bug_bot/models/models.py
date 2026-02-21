@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, date
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, Date, ForeignKey, Index
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -265,4 +266,23 @@ class OnCallHistory(Base):
     __table_args__ = (
         Index("idx_oncall_history_team_effective", "team_id", "effective_date"),
         Index("idx_oncall_history_team_created", "team_id", "created_at"),
+    )
+
+
+class RagDocument(Base):
+    __tablename__ = "rag_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    embedding = mapped_column(Vector(384), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_rag_documents_source", "source_type", "source_id"),
     )

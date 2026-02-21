@@ -1,11 +1,15 @@
 import asyncio
+import logging
 from datetime import datetime, date
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel
 
 from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
 from bug_bot.oncall import service as oncall_service
+
+logger = logging.getLogger(__name__)
 from bug_bot.schemas.admin import (
     BugConversationListResponse,
     BugConversationResponse,
@@ -78,30 +82,27 @@ async def get_dashboard(repo: BugRepository = Depends(get_repo)):
 
 
 async def _resolve_tagged_on(
-    repo: BugRepository, relevant_services: list[str] | None,
+    repo: BugRepository,
+    relevant_services: list[str] | None,
+    as_of_date: date | None = None,
 ) -> list[TaggedOnEntry]:
+    """Resolve on-call entries for the given services.
+
+    When as_of_date is set, uses on-call as of that date (for historical tagged_on).
+    When as_of_date is None, uses current/today (e.g. for nudge).
+    """
     if not relevant_services:
         return []
-    mappings = await repo.get_service_mappings_by_names(relevant_services)
-    seen: set[str] = set()
-    entries: list[TaggedOnEntry] = []
-    for m in mappings:
-        oncall = None
-        if m.team and m.team.oncall_engineer:
-            oncall = m.team.oncall_engineer
-        if not oncall:
-            oncall = m.primary_oncall
-        service_owner = m.service_owner
-        slack_group_id = m.team.slack_group_id if m.team else None
-        key = oncall or service_owner or slack_group_id or ""
-        if key and key not in seen:
-            seen.add(key)
-            entries.append(TaggedOnEntry(
-                oncall_engineer=oncall,
-                service_owner=service_owner,
-                slack_group_id=slack_group_id,
-            ))
-    return entries
+    check_date = as_of_date if as_of_date is not None else date.today()
+    raw = await repo.get_oncall_for_services(relevant_services, check_date=check_date)
+    return [
+        TaggedOnEntry(
+            oncall_engineer=e.get("oncall_engineer"),
+            service_owner=e.get("service_owner"),
+            slack_group_id=e.get("slack_group_id"),
+        )
+        for e in raw
+    ]
 
 
 def _validate_status_transition(current: str, new: str) -> None:
@@ -146,16 +147,6 @@ async def list_bugs(
         sort=sort,
     )
 
-    all_services: set[str] = set()
-    for _bug, inv in rows:
-        if inv and inv.relevant_services:
-            all_services.update(inv.relevant_services)
-
-    service_mappings = await repo.get_service_mappings_by_names(list(all_services)) if all_services else []
-    svc_map: dict[str, list] = {}
-    for m in service_mappings:
-        svc_map.setdefault(m.service_name.lower(), []).append(m)
-
     items: list[BugListItem] = []
     for bug, investigation in rows:
         investigation_summary = None
@@ -166,24 +157,15 @@ async def list_bugs(
                 "fix_type": investigation.fix_type,
                 "confidence": investigation.confidence,
             }
-            seen: set[str] = set()
-            for svc in (investigation.relevant_services or []):
-                for m in svc_map.get(svc.lower(), []):
-                    oncall = None
-                    if m.team and m.team.oncall_engineer:
-                        oncall = m.team.oncall_engineer
-                    if not oncall:
-                        oncall = m.primary_oncall
-                    service_owner = m.service_owner
-                    slack_group_id = m.team.slack_group_id if m.team else None
-                    key = oncall or service_owner or slack_group_id or ""
-                    if key and key not in seen:
-                        seen.add(key)
-                        tagged_on.append(TaggedOnEntry(
-                            oncall_engineer=oncall,
-                            service_owner=service_owner,
-                            slack_group_id=slack_group_id,
-                        ))
+            as_of = bug.created_at.date() if bug.created_at else date.today()
+            tagged_on = await _resolve_tagged_on(
+                repo, investigation.relevant_services or [], as_of_date=as_of
+            )
+            current_on_call = await _resolve_tagged_on(
+                repo, investigation.relevant_services or [], as_of_date=None
+            )
+        else:
+            current_on_call = []
 
         items.append(
             BugListItem(
@@ -202,6 +184,7 @@ async def list_bugs(
                 assignee_user_id=bug.assignee_user_id,
                 investigation_summary=investigation_summary,
                 tagged_on=tagged_on,
+                current_on_call=current_on_call,
             )
         )
 
@@ -216,13 +199,20 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
     tagged_on: list[TaggedOnEntry] = []
+    current_on_call: list[TaggedOnEntry] = []
     if investigation is not None:
         investigation_summary = {
             "summary": investigation.summary,
             "fix_type": investigation.fix_type,
             "confidence": investigation.confidence,
         }
-        tagged_on = await _resolve_tagged_on(repo, investigation.relevant_services)
+        as_of = bug.created_at.date() if bug.created_at else date.today()
+        tagged_on = await _resolve_tagged_on(
+            repo, investigation.relevant_services or [], as_of_date=as_of
+        )
+        current_on_call = await _resolve_tagged_on(
+            repo, investigation.relevant_services or [], as_of_date=None
+        )
     return BugListItem(
         id=str(bug.id),
         bug_id=bug.bug_id,
@@ -239,6 +229,7 @@ async def get_bug_detail(bug_id: str, repo: BugRepository = Depends(get_repo)):
         assignee_user_id=bug.assignee_user_id,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
+        current_on_call=current_on_call,
     )
 
 
@@ -263,13 +254,20 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
     investigation = await repo.get_investigation(bug_id)
     investigation_summary = None
     tagged_on: list[TaggedOnEntry] = []
+    current_on_call: list[TaggedOnEntry] = []
     if investigation is not None:
         investigation_summary = {
             "summary": investigation.summary,
             "fix_type": investigation.fix_type,
             "confidence": investigation.confidence,
         }
-        tagged_on = await _resolve_tagged_on(repo, investigation.relevant_services)
+        as_of = updated.created_at.date() if updated.created_at else date.today()
+        tagged_on = await _resolve_tagged_on(
+            repo, investigation.relevant_services or [], as_of_date=as_of
+        )
+        current_on_call = await _resolve_tagged_on(
+            repo, investigation.relevant_services or [], as_of_date=None
+        )
     return BugListItem(
         id=str(updated.id),
         bug_id=updated.bug_id,
@@ -286,6 +284,7 @@ async def update_bug(bug_id: str, payload: BugUpdate, repo: BugRepository = Depe
         assignee_user_id=updated.assignee_user_id,
         investigation_summary=investigation_summary,
         tagged_on=tagged_on,
+        current_on_call=current_on_call,
     )
 
 
@@ -1308,4 +1307,89 @@ async def lookup_slack_users(
         pass
 
     return SlackUsersLookupResponse(users=results, team_id=team_id)
+
+
+# --- RAG Chat ---
+
+
+class ChatMessageItem(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_history: list[ChatMessageItem] = []
+
+
+class ChatSourceItem(BaseModel):
+    bug_id: str
+    source_type: str
+    chunk_text: str
+    similarity: float
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    sources: list[ChatSourceItem]
+
+
+class RagIndexResponse(BaseModel):
+    status: str
+    total: int
+    indexed: dict
+
+
+class RagStatsResponse(BaseModel):
+    total_documents: int
+    by_type: dict
+    last_indexed_at: str | None
+
+
+@router.post("/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest):
+    """RAG-powered chat endpoint — answers questions about bugs and investigations."""
+    from bug_bot.rag.chat import rag_chat
+
+    async with async_session() as session:
+        try:
+            history = [{"role": m.role, "content": m.content} for m in payload.conversation_history]
+            result = await rag_chat(session, payload.message, history)
+        except Exception as e:
+            logger.exception("RAG chat error")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Chat error: {e}",
+            )
+    return ChatResponse(
+        answer=result["answer"],
+        sources=[ChatSourceItem(**s) for s in result["sources"]],
+    )
+
+
+@router.post("/rag/index", response_model=RagIndexResponse)
+async def rag_reindex():
+    """Trigger a full re-index of all bugs, investigations, and findings."""
+    from bug_bot.rag.indexer import reindex_all
+
+    async with async_session() as session:
+        try:
+            result = await reindex_all(session)
+        except Exception as e:
+            logger.exception("RAG reindex error")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Reindex error: {e}",
+            )
+    return RagIndexResponse(status="completed", total=result["total"], indexed=result["indexed"])
+
+
+@router.get("/rag/stats", response_model=RagStatsResponse)
+async def rag_stats():
+    """Return RAG index statistics."""
+    from bug_bot.rag.vectorstore import get_stats
+
+    async with async_session() as session:
+        stats = await get_stats(session)
+    return RagStatsResponse(**stats)
 
