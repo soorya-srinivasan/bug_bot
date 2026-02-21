@@ -27,22 +27,26 @@ For every bug report, answer these questions first:
 - Identify whether the error is consistent or intermittent
 
 ### Phase 3 — Culprit Commit
-Identify the exact commit that introduced the regression:
+Identify the exact commit that introduced the regression using GitHub MCP only:
 
 1. Get the **first error timestamp** from Loki logs
 2. List merged PRs/commits on the service repo around that time:
    ```
-   github.list_commits(repo: "shopuptech/<repo>", until: "<first_error_timestamp>", per_page: 20)
+   mcp__github__list_commits(repo: "shopuptech/<repo>", until: "<first_error_timestamp>", per_page: 20)
    ```
 3. Find the **last green commit** (just before errors started) and the **first bad commit** (when errors began)
 4. Diff the bad commit to confirm it touches the suspected code path:
    ```
-   github.compare(repo: "shopuptech/<repo>", base: "<last_good_sha>", head: "<first_bad_sha>")
+   mcp__github__compare(repo: "shopuptech/<repo>", base: "<last_good_sha>", head: "<first_bad_sha>")
    ```
 5. Record the culprit commit SHA and PR number in your findings before proceeding to a fix
 
+> **GUARDRAIL**: Use `mcp__github__*` for all code and commit access. Do not clone the repo
+> or use Bash/Read/Grep to inspect code during investigation phases.
+
 ### Phase 4 — Root Cause
-- Read the culprit commit diff via GitHub (do not clone unless necessary)
+- Read the culprit commit diff via `mcp__github__get_commit` or `mcp__github__compare`
+- Do NOT clone the repo to read code — use `mcp__github__get_file_contents` instead
 - Query the database read-only if data corruption is suspected
 
 ### Phase 5 — Fix or Escalate

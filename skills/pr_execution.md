@@ -2,6 +2,9 @@
 
 Use this guide when a root cause has been identified and a code fix is warranted.
 
+All repository operations use the **GitHub MCP** (`mcp__github__*`) via the GitHub API.
+No local git clone, no Bash git commands.
+
 ## Pre-PR Checklist
 
 Before creating a branch or writing code, confirm:
@@ -10,50 +13,83 @@ Before creating a branch or writing code, confirm:
 - [ ] Fix does not require a data migration (if so, loop in the owning team)
 - [ ] You have identified the correct repo and base branch (usually `main` or `master`)
 
-## Step 1 — Create a Branch
+---
 
-Branch naming convention:
-```
-bugfix/<bug-id>-<short-description>
-```
-
-Example: `bugfix/BUG-1234-nil-payment-reference`
+## Step 1 — Read the File(s) to Change
 
 ```
-git.create_branch(
-  repo: "shopuptech/<repo>",
-  branch: "bugfix/<bug-id>-<short-description>",
-  from: "main"
+mcp__github__get_file_contents(
+  owner: "<GITHUB_ORG>",
+  repo:  "<repo>",
+  path:  "path/to/file.cs",
+  ref:   "main"
 )
 ```
 
-## Step 2 — Apply the Fix
+Save the returned `sha` — you will need it in Step 3 to update the file.
 
-- Search for the relevant file via `github.search_code` before editing
-- Make the smallest change that fixes the root cause
-- For .NET services: follow existing code style; do not remove existing null checks
-- For Rails services: follow RuboCop conventions; prefer safe navigation (`&.`) over explicit nil checks
+---
 
-## Step 3 — Commit
+## Step 2 — Create a Branch
 
-Commit message format:
+Branch naming convention: `bugfix/<bug-id>-<short-description>`
+
 ```
-fix(<service>): <short description>
-
-<one paragraph explaining root cause and how the fix addresses it>
-
-Bug: <bug-id>
+mcp__github__create_branch(
+  owner:       "<GITHUB_ORG>",
+  repo:        "<repo>",
+  branch:      "bugfix/<bug-id>-<short-description>",
+  from_branch: "main"
+)
 ```
+
+---
+
+## Step 3 — Commit the Fix
+
+### Single file
+
+```
+mcp__github__create_or_update_file(
+  owner:   "<GITHUB_ORG>",
+  repo:    "<repo>",
+  path:    "path/to/file.cs",
+  message: "fix(<service>): <short description>\n\n<body>\n\nBug: <bug-id>",
+  content: "<base64-encoded new file content>",
+  branch:  "bugfix/<bug-id>-<short-description>",
+  sha:     "<sha from Step 1>"
+)
+```
+
+### Multiple files (single commit)
+
+```
+mcp__github__push_files(
+  owner:   "<GITHUB_ORG>",
+  repo:    "<repo>",
+  branch:  "bugfix/<bug-id>-<short-description>",
+  message: "fix(<service>): <short description>\n\n<body>\n\nBug: <bug-id>",
+  files: [
+    { path: "path/to/file1.cs", content: "<new content>" },
+    { path: "path/to/file2.cs", content: "<new content>" }
+  ]
+)
+```
+
+`push_files` content is plain text (not base64); `create_or_update_file` content is base64.
+
+---
 
 ## Step 4 — Create the PR
 
 ```
-github.create_pull_request(
-  repo: "shopuptech/<repo>",
-  title: "fix(<service>): <short description>",
-  body: "<PR body — see template below>",
-  head: "bugfix/<bug-id>-<short-description>",
-  base: "main"
+mcp__github__create_pull_request(
+  owner: "<GITHUB_ORG>",
+  repo:  "<repo>",
+  title: "fix(<service>): <short description> [<bug-id>]",
+  body:  "<PR body — see template below>",
+  head:  "bugfix/<bug-id>-<short-description>",
+  base:  "main"
 )
 ```
 
@@ -77,6 +113,8 @@ github.create_pull_request(
 - Bug ID: <bug-id>
 - Investigation log: <link or summary>
 ```
+
+---
 
 ## Step 5 — Post-PR
 
