@@ -125,6 +125,7 @@ class ServiceTeamMapping(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     service_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     github_repo: Mapped[str] = mapped_column(String(200), nullable=False)
     team_slack_group: Mapped[str | None] = mapped_column(String(30))
     primary_oncall: Mapped[str | None] = mapped_column(String(20))

@@ -52,9 +52,10 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_org: str = ""
 
-    # Grafana
-    grafana_url: str = ""
+    # Grafana / Loki
+    grafana_url: str = "http://localhost:3000"
     grafana_api_key: str = ""
+    loki_url: str = "http://localhost:3100"
 
     # New Relic
     newrelic_api_key: str = ""

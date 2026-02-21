@@ -188,7 +188,7 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                 cur.execute(
                     """
                     SELECT
-                        s.service_name, s.github_repo, s.tech_stack,
+                        s.service_name, s.github_repo, s.tech_stack, s.description,
                         s.team_slack_group, s.service_owner, s.primary_oncall,
                         t.slack_group_id, t.oncall_engineer AS team_oncall
                     FROM service_team_mapping s
@@ -201,8 +201,10 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                 row = cur.fetchone()
                 if not row:
                     return f"No mapping found for service: {service_name}"
+                desc_line = f"Description: {row['description']}\n" if row.get("description") else ""
                 return (
                     f"Service: {row['service_name']}\n"
+                    f"{desc_line}"
                     f"GitHub repo: {row['github_repo']}\n"
                     f"Tech stack: {row['tech_stack']}\n"
                     f"Service owner: {row['service_owner'] or row['primary_oncall'] or 'N/A'}\n"
@@ -233,12 +235,16 @@ def _list_services_sync() -> str:
         with psycopg.connect(_bugbot_conninfo(), row_factory=dict_row) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT service_name, tech_stack FROM service_team_mapping ORDER BY service_name;"
+                    "SELECT service_name, tech_stack, description, github_repo FROM service_team_mapping ORDER BY service_name;"
                 )
                 rows = cur.fetchall()
                 if not rows:
                     return "No services registered."
-                lines = [f"- {r['service_name']} ({r['tech_stack']})" for r in rows]
+                lines = []
+                for r in rows:
+                    desc = f" — {r['description']}" if r.get("description") else ""
+                    repo = f" [{r['github_repo']}]" if r.get("github_repo") else ""
+                    lines.append(f"- {r['service_name']} ({r['tech_stack']}){desc}{repo}")
                 return "Known services:\n" + "\n".join(lines)
     except Exception as e:
         return f"Error listing services: {e}"
@@ -254,6 +260,99 @@ async def list_services(args: dict[str, Any]) -> dict[str, Any]:
     return _text_result(text)
   
  
+def _list_datasources_sync() -> str:
+    """Query Grafana HTTP API to list all configured datasources (name, type, UID)."""
+    grafana_url = (settings.grafana_url or "http://localhost:3000").rstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if settings.grafana_api_key:
+        headers["Authorization"] = f"Bearer {settings.grafana_api_key}"
+    try:
+        with httpx.Client(timeout=10.0) as http:
+            resp = http.get(f"{grafana_url}/api/datasources", headers=headers)
+        if resp.status_code != 200:
+            return f"Error: Grafana returned HTTP {resp.status_code} at {grafana_url}. Response: {resp.text[:300]}"
+        datasources = resp.json()
+        if not datasources:
+            return "No datasources configured in Grafana."
+        lines = []
+        for ds in datasources:
+            lines.append(
+                f"- name={ds.get('name')}  type={ds.get('type')}  uid={ds.get('uid')}  url={ds.get('url')}"
+            )
+        return f"Grafana datasources ({grafana_url}):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error reaching Grafana at {grafana_url}: {e}"
+
+
+@tool(
+    "list_datasources",
+    "List all Grafana datasources (name, type, UID). Call this first to get the Loki datasource UID before querying logs.",
+    {},
+)
+async def list_datasources(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(_list_datasources_sync)
+    return _text_result(text)
+
+
+def _query_loki_logs_sync(query: str, start_offset_minutes: int, limit: int) -> str:
+    """Query Loki directly via HTTP API."""
+    import time as _time
+
+    loki_url = (settings.loki_url or "http://localhost:3100").rstrip("/")
+    now_ns = int(_time.time() * 1e9)
+    start_ns = now_ns - int(start_offset_minutes * 60 * 1e9)
+
+    params = {
+        "query": query,
+        "start": str(start_ns),
+        "end": str(now_ns),
+        "limit": str(min(limit or 100, 500)),
+        "direction": "backward",
+    }
+    try:
+        with httpx.Client(timeout=30.0) as http:
+            resp = http.get(f"{loki_url}/loki/api/v1/query_range", params=params)
+        if resp.status_code != 200:
+            return f"Error: Loki returned HTTP {resp.status_code}. Response: {resp.text[:500]}"
+        data = resp.json()
+        results = data.get("data", {}).get("result", [])
+        if not results:
+            return f"No log lines found for query: {query} (last {start_offset_minutes} minutes)"
+        total_lines = sum(len(r.get("values", [])) for r in results)
+        lines = [f"Found {total_lines} log line(s) across {len(results)} stream(s) for: {query}\n"]
+        for stream in results:
+            labels = stream.get("stream", {})
+            label_str = ", ".join(f'{k}="{v}"' for k, v in labels.items())
+            lines.append(f"Stream [{label_str}]:")
+            for ts_ns, log_line in stream.get("values", [])[:25]:
+                import datetime
+                ts = datetime.datetime.fromtimestamp(int(ts_ns) / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+                lines.append(f"  [{ts}] {log_line}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error reaching Loki at {loki_url}: {e}"
+
+
+@tool(
+    "query_loki_logs",
+    (
+        "Query Grafana Loki logs using a LogQL expression. "
+        "Use label selectors like {app=\"payment-service-sample\"} or {job=\"vconnect\"} with filters like |= \"error\". "
+        "start_offset_minutes controls how far back to look (default 60, use 360 for 6 hours). "
+        "Returns matching log lines with timestamps."
+    ),
+    {"query": str, "start_offset_minutes": int, "limit": int},
+)
+async def query_loki_logs(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(
+        _query_loki_logs_sync,
+        args["query"],
+        args.get("start_offset_minutes", 60),
+        args.get("limit", 100),
+    )
+    return _text_result(text)
+
+
 def _report_finding_sync(bug_id: str, category: str, finding: str, severity: str) -> str:
     if psycopg is None:
         return "Error: psycopg not installed."
@@ -495,6 +594,8 @@ def build_custom_tools_server():
         name="bugbot_tools",
         version="1.0.0",
         tools=[
+            list_datasources,
+            query_loki_logs,
             lookup_service_owner,
             list_services,
             report_finding,

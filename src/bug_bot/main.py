@@ -17,6 +17,7 @@ from bug_bot.slack.app import slack_app, slack_handler
 from bug_bot.slack.handlers import register_handlers
 from bug_bot.triage import triage_bug_report
 from bug_bot.api.routes import router as api_router
+from bug_bot.api.logs import router as logs_router
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ app.add_middleware(
 
 app.include_router(admin_api.router, prefix="/api/admin", tags=["admin"])
 app.include_router(api_router)
+app.include_router(logs_router, prefix="/api/logs", tags=["logs"])
 
 
 @app.get("/health")

@@ -80,25 +80,42 @@ def build_investigation_prompt(
 ## Investigation Steps
 Follow these steps in order:
 
-1. **Observability — Grafana Loki**
-   Use the Grafana MCP (`mcp__grafana__*`) to query Loki for error logs from the affected services.
-   Steps:
-   a. Call `mcp__grafana__list_datasources` to find the Loki datasource UID.
-   b. Call `mcp__grafana__query_loki_logs` with the UID and a LogQL query.
-      LogQL patterns (substitute the actual service name):
-        `{{app="{services_str}", level="error"}} |~ "ZeroDivisionError|Exception|Error|Traceback"`
-        `{{app="{services_str}", env="local"}} | json | level="error"`
-      Log labels used by services: `app`, `env`, `level`.
-   If a tool name is uncertain, first list all `mcp__grafana__*` tools and use the appropriate one.
-   Use `mcp__bugbot_tools__report_finding` to record significant errors found in the logs.
-   c. After querying, construct a direct Grafana Explore link using the GRAFANA_URL env var,
-      the datasource UID, and the exact LogQL query you used. Format:
-      `<GRAFANA_URL>/explore?orgId=1&left=%7B"datasource":"<UID>","queries":%5B%7B"expr":"<URL-encoded LogQL>","refId":"A"%7D%5D,"range":%7B"from":"now-1h","to":"now"%7D%7D`
-      Set this URL in the `grafana_logs_url` field of your response.
+1. **Observability — Grafana Loki (MANDATORY FIRST STEP)**
+   Grafana is running at http://localhost:3000 and Loki at http://localhost:3100.
+   You MUST query Loki before doing anything else.
 
-2. **Code Search** — Use `mcp__bugbot_tools__lookup_service_owner` to find the GitHub repo for
-   each affected service. Then use `mcp__github__search_code` or `mcp__github__get_file_contents`
-   to locate the function or file mentioned in the error traceback from the logs.
+   a. Call `mcp__bugbot_tools__list_datasources` to get the Loki datasource UID.
+      - If this call fails or returns an error, set `summary` to:
+        "Grafana Loki is unreachable (http://localhost:3000). Cannot fetch logs — manual investigation required."
+        Set `fix_type="needs_human"`, `action="escalate"`, `confidence=0.0` and STOP. Do not proceed further.
+
+   b. Query logs using `mcp__bugbot_tools__query_loki_logs` with a LogQL expression.
+      Try these queries in order until you get results (substitute service name where shown):
+        - `{{app="{services_str}"}} |= "error"`
+        - `{{app="{services_str}"}} |~ "(?i)error|exception|traceback"`
+        - `{{service_name="{services_str}"}} |= "error"`
+        - `{{job="{services_str}"}} |~ "(?i)error|exception|traceback"`
+        - `{{}} |= "{services_str}" |~ "(?i)error|exception"` (broad fallback)
+      Start with start_offset_minutes=60. If no logs are found, retry with start_offset_minutes=360.
+
+   c. If the query tool call itself succeeds but returns no log lines, record that explicitly:
+      "No error logs found in Grafana Loki for service {services_str} in the last 6 hours."
+      Continue to step 2 with this note in your summary.
+
+   d. If logs ARE found:
+      - Record the error type, message, frequency, and first/last occurrence using `mcp__bugbot_tools__report_finding`.
+      - Note the exact log labels returned so you can use them in subsequent queries.
+      - Construct a Grafana Explore deep-link:
+        `http://localhost:3000/explore?orgId=1&left=%7B"datasource":"<UID>","queries":%5B%7B"expr":"<URL-encoded LogQL>","refId":"A"%7D%5D,"range":%7B"from":"now-1h","to":"now"%7D%7D`
+        Set this URL in the `grafana_logs_url` field of your response.
+
+2. **Code Search** — Call `mcp__bugbot_tools__list_services` early to get all canonical service
+   names. If the bug mentions any term that matches a service's name or description, include that
+   service in your investigation even if it wasn't explicitly named. When multiple services could
+   be involved, investigate all of them.
+   Use `mcp__bugbot_tools__lookup_service_owner` to find the GitHub repo for each affected service.
+   Then use `mcp__github__search_code` or `mcp__github__get_file_contents` to locate the function
+   or file mentioned in the error traceback from the logs.
 
 3. **Code Analysis** — Use `mcp__git__clone_repository` to clone the repo to
    `/tmp/bugbot-workspace/<repo-name>`. Read the specific file and function from the traceback.
