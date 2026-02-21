@@ -252,6 +252,30 @@ async def escalate_to_humans(input: EscalationInput) -> None:
 
 
 @activity.defn
+async def post_to_summary_thread(bug_id: str, text: str) -> None:
+    """Post a follow-up message in the existing #bug-summaries thread for a bug."""
+    if not _slack_configured():
+        activity.logger.info(f"[Slack skip] Summary follow-up for {bug_id}: {text}")
+        return
+
+    from bug_bot.db.session import async_session
+    from bug_bot.db.repository import BugRepository
+
+    async with async_session() as session:
+        inv = await BugRepository(session).get_investigation(bug_id)
+        if not inv or not inv.summary_thread_ts:
+            activity.logger.warning(f"No summary thread found for {bug_id}, skipping follow-up")
+            return
+
+    client = _get_slack_client()
+    await client.chat_postMessage(
+        channel=settings.bug_summaries_channel_id,
+        thread_ts=inv.summary_thread_ts,
+        text=text,
+    )
+
+
+@activity.defn
 async def send_follow_up(input: PostMessageInput) -> None:
     """Send a periodic follow-up reminder in the thread."""
     if not _slack_configured():

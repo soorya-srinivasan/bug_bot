@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
         post_investigation_results,
         create_summary_thread,
         escalate_to_humans,
+        post_to_summary_thread,
         PostMessageInput,
         PostResultsInput,
         EscalationInput,
@@ -54,6 +55,8 @@ class BugInvestigationWorkflow:
         # Guards against double-running cleanup_workspace when the finally block
         # fires after a path that already called it explicitly.
         self._workspace_cleaned: bool = False
+        # Prevents starting the SLA child workflow more than once.
+        self._sla_tracking_started: bool = False
         # Dev takeover state
         self._dev_takeover: bool = False
         self._takeover_user_id: str | None = None
@@ -84,16 +87,15 @@ class BugInvestigationWorkflow:
             return await self._run(input)
         finally:
             if not self._workspace_cleaned:
-                async with workflow.CancellationScope(detached=True):
-                    try:
-                        await workflow.execute_activity(
-                            cleanup_workspace, args=[input.bug_id],
-                            start_to_close_timeout=timedelta(seconds=30),
-                        )
-                    except Exception:
-                        workflow.logger.warning(
-                            "Cleanup activity failed for %s during teardown", input.bug_id
-                        )
+                try:
+                    await workflow.execute_activity(
+                        cleanup_workspace, args=[input.bug_id],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                except Exception:
+                    workflow.logger.warning(
+                        "Cleanup activity failed for %s during teardown", input.bug_id
+                    )
 
     async def _run(self, input: BugReportInput) -> dict:
         parsed: ParsedBug = await workflow.execute_activity(
@@ -136,25 +138,33 @@ class BugInvestigationWorkflow:
 
             # ── ask_reporter: need more info before we can post findings ───────
             if action == "ask_reporter":
-                clarification_question = investigation_dict.get("clarification_question", "")
+                questions: list[str] = investigation_dict.get("clarification_questions") or []
+                if len(questions) == 1:
+                    slack_text = f":speech_balloon: *Bug Bot has a question:*\n{questions[0]}"
+                elif questions:
+                    numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(questions, 1))
+                    slack_text = f":speech_balloon: *Bug Bot has a few questions:*\n{numbered}"
+                else:
+                    slack_text = ":speech_balloon: *Bug Bot needs more information to continue the investigation.*"
+                log_text = "\n".join(questions)
                 await workflow.execute_activity(
                     post_slack_message,
                     PostMessageInput(
                         channel_id=input.channel_id,
                         thread_ts=input.thread_ts,
-                        text=f":speech_balloon: *Bug Bot has a question:*\n{clarification_question}",
+                        text=slack_text,
                     ),
                     start_to_close_timeout=timedelta(seconds=15),
                 )
                 await workflow.execute_activity(
                     log_conversation_event,
                     args=[input.bug_id, "clarification_request", "bot", "bugbot",
-                          input.channel_id, clarification_question, None],
+                          input.channel_id, log_text, None],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
 
                 self._state = WorkflowState.AWAITING_REPORTER
-                reporter_arrived = await workflow.wait_condition(
+                await workflow.wait_condition(
                     lambda: self._close_requested or any(
                         m.sender_type == "reporter" for m in self._message_queue
                     ),
@@ -166,7 +176,8 @@ class BugInvestigationWorkflow:
                     await self._handle_close(input)
                     return {"fix_type": "closed_by_reporter", "bug_id": input.bug_id}
 
-                if not reporter_arrived:
+                reporter_has_messages = any(m.sender_type == "reporter" for m in self._message_queue)
+                if not reporter_has_messages:
                     workflow.logger.info(
                         f"No clarification reply for {input.bug_id} in 2 h — proceeding"
                     )
@@ -186,125 +197,141 @@ class BugInvestigationWorkflow:
                 action = investigation_dict.get("action", "post_findings")
                 continue
 
-            # ── All other actions: save + post results ────────────────────────
-            await workflow.execute_activity(
-                save_investigation_result, args=[input.bug_id, investigation_dict],
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            await workflow.execute_activity(
-                log_conversation_event,
-                args=[input.bug_id, "investigation_result", "bot", "bugbot", None,
-                      investigation_dict.get("summary"),
-                      {"fix_type": investigation_dict.get("fix_type"),
-                       "confidence": investigation_dict.get("confidence")}],
-                start_to_close_timeout=timedelta(seconds=10),
-            )
-            if investigation_dict.get("pr_url"):
+            # ── Dev follow-up: reply in the existing summary thread ────────
+            if self._dev_replied and self._summary_thread_created:
                 await workflow.execute_activity(
                     log_conversation_event,
-                    args=[input.bug_id, "pr_created", "bot", "bugbot", None,
-                          investigation_dict.get("pr_url"), None],
+                    args=[input.bug_id, "investigation_result", "bot", "bugbot", None,
+                          investigation_dict.get("summary"),
+                          {"fix_type": investigation_dict.get("fix_type"),
+                           "confidence": investigation_dict.get("confidence")}],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
-
-            results_input = PostResultsInput(
-                channel_id=input.channel_id, thread_ts=input.thread_ts,
-                bug_id=input.bug_id, severity=parsed.severity, result=investigation_dict,
-            )
-            await workflow.execute_activity(
-                post_investigation_results, results_input,
-                start_to_close_timeout=timedelta(seconds=15),
-            )
-
-            # Create the #bug-summaries thread only on the first post; subsequent
-            # investigation results are posted into the existing thread by
-            # post_investigation_results using the stored summary_thread_ts.
-            # Fetch on-call for relevant services so we tag them in the summary channel.
-            if not self._summary_thread_created:
-                # Use agent-detected services if available, otherwise fall back to parsed services
-                relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
-                workflow.logger.info(f"Fetching on-call for services: {relevant_services}")
-                oncall_entries: list[dict] = await workflow.execute_activity(
-                    fetch_oncall_for_services,
-                    args=[relevant_services],
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-                summary_input = replace(results_input, oncall_entries=oncall_entries)
-                summary_thread_ts: str = await workflow.execute_activity(
-                    create_summary_thread, summary_input,
+                response_text = investigation_dict.get("summary", "Follow-up investigation complete.")
+                await workflow.execute_activity(
+                    post_to_summary_thread,
+                    args=[input.bug_id, f":mag: *Follow-up for {input.bug_id}:*\n{response_text}"],
                     start_to_close_timeout=timedelta(seconds=15),
                 )
-                if summary_thread_ts:
+
+                if action == "resolved":
                     await workflow.execute_activity(
-                        store_summary_thread_ts, args=[input.bug_id, summary_thread_ts],
+                        update_bug_status, args=[input.bug_id, "resolved"],
                         start_to_close_timeout=timedelta(seconds=10),
                     )
-                self._summary_thread_created = True
+                    await workflow.execute_activity(
+                        log_conversation_event,
+                        args=[input.bug_id, "resolved", "bot", "bugbot", None,
+                              investigation_dict.get("summary", "Resolved after dev review"), None],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                    self._workspace_cleaned = True
+                    await workflow.execute_activity(
+                        cleanup_workspace, args=[input.bug_id],
+                        start_to_close_timeout=timedelta(seconds=30),
+                    )
+                    return investigation_dict
+                # No status change or re-escalation; fall through to wait for dev
 
-            # ── action == "resolved" is only honoured after a dev has replied ──
-            # (means dev asked the agent to close and the agent confirmed it)
-            if action == "resolved" and self._dev_replied:
+            else:
+                # ── First investigation: save + post to #bug-reports + create summary
                 await workflow.execute_activity(
-                    update_bug_status, args=[input.bug_id, "resolved"],
+                    save_investigation_result, args=[input.bug_id, investigation_dict],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
                 await workflow.execute_activity(
                     log_conversation_event,
-                    args=[input.bug_id, "resolved", "bot", "bugbot", None,
-                          investigation_dict.get("summary", "Resolved after dev review"), None],
+                    args=[input.bug_id, "investigation_result", "bot", "bugbot", None,
+                          investigation_dict.get("summary"),
+                          {"fix_type": investigation_dict.get("fix_type"),
+                           "confidence": investigation_dict.get("confidence")}],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
-                self._workspace_cleaned = True
-                await workflow.execute_activity(
-                    cleanup_workspace, args=[input.bug_id],
-                    start_to_close_timeout=timedelta(seconds=30),
-                )
-                return investigation_dict
-
-            # ── Escalate if needed (SLA child runs in parallel; we still wait) ─
-            if action == "escalate":
-                # Use agent-detected services if available, otherwise fall back to parsed services
-                relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
-                workflow.logger.info(f"Escalating - fetching on-call for services: {relevant_services}")
-                oncall_entries: list[dict] = await workflow.execute_activity(
-                    fetch_oncall_for_services,
-                    args=[relevant_services],
-                    start_to_close_timeout=timedelta(seconds=10),
+                if investigation_dict.get("pr_url"):
+                    await workflow.execute_activity(
+                        log_conversation_event,
+                        args=[input.bug_id, "pr_created", "bot", "bugbot", None,
+                              investigation_dict.get("pr_url"), None],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                results_input = PostResultsInput(
+                    channel_id=input.channel_id, thread_ts=input.thread_ts,
+                    bug_id=input.bug_id, severity=parsed.severity, result=investigation_dict,
                 )
                 await workflow.execute_activity(
-                    escalate_to_humans,
-                    EscalationInput(
-                        channel_id=input.channel_id, thread_ts=input.thread_ts,
-                        bug_id=input.bug_id, severity=parsed.severity,
-                        relevant_services=relevant_services,
-                        oncall_entries=oncall_entries,
-                    ),
+                    post_investigation_results, results_input,
                     start_to_close_timeout=timedelta(seconds=15),
                 )
-                await workflow.start_child_workflow(
-                    SLATrackingWorkflow.run,
-                    SLATrackingInput(
-                        bug_id=input.bug_id, severity=parsed.severity,
-                        channel_id=input.channel_id, thread_ts=input.thread_ts,
-                        assigned_users=investigation_dict.get("recommended_actions", []),
-                    ),
-                    id=f"sla-{input.bug_id}",
-                )
-                await workflow.execute_activity(
-                    update_bug_status, args=[input.bug_id, "escalated"],
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
-            else:
-                # post_findings or resolved-before-dev-reply: wait for dev
-                await workflow.execute_activity(
-                    update_bug_status, args=[input.bug_id, "pending_verification"],
-                    start_to_close_timeout=timedelta(seconds=10),
-                )
+
+                if not self._summary_thread_created:
+                    # Use agent-detected services if available, otherwise fall back to parsed services
+                    relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
+                    workflow.logger.info(f"Fetching on-call for services: {relevant_services}")
+                    oncall_entries: list[dict] = await workflow.execute_activity(
+                        fetch_oncall_for_services,
+                        args=[relevant_services],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                    summary_input = replace(results_input, oncall_entries=oncall_entries)
+                    summary_thread_ts: str = await workflow.execute_activity(
+                        create_summary_thread, summary_input,
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    if summary_thread_ts:
+                        await workflow.execute_activity(
+                            store_summary_thread_ts, args=[input.bug_id, summary_thread_ts],
+                            start_to_close_timeout=timedelta(seconds=10),
+                        )
+                    self._summary_thread_created = True
+
+                # ── Escalate if needed ───────────────────────────────────────
+                if action == "escalate":
+                    # Use agent-detected services if available, otherwise fall back to parsed services
+                    relevant_services = investigation_dict.get("relevant_services") or parsed.relevant_services
+                    workflow.logger.info(f"Escalating - fetching on-call for services: {relevant_services}")
+                    oncall_entries: list[dict] = await workflow.execute_activity(
+                        fetch_oncall_for_services,
+                        args=[relevant_services],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                    await workflow.execute_activity(
+                        escalate_to_humans,
+                        EscalationInput(
+                            channel_id=input.channel_id, thread_ts=input.thread_ts,
+                            bug_id=input.bug_id, severity=parsed.severity,
+                            relevant_services=relevant_services,
+                            oncall_entries=oncall_entries,
+                        ),
+                        start_to_close_timeout=timedelta(seconds=15),
+                    )
+                    if not self._sla_tracking_started:
+                        await workflow.start_child_workflow(
+                            SLATrackingWorkflow.run,
+                            SLATrackingInput(
+                                bug_id=input.bug_id, severity=parsed.severity,
+                                channel_id=input.channel_id, thread_ts=input.thread_ts,
+                                assigned_users=investigation_dict.get("recommended_actions", []),
+                            ),
+                            id=f"sla-{input.bug_id}",
+                        )
+                        self._sla_tracking_started = True
+                    await workflow.execute_activity(
+                        update_bug_status, args=[input.bug_id, "escalated"],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
+                else:
+                    # post_findings or resolved-before-dev-reply: wait for dev
+                    await workflow.execute_activity(
+                        update_bug_status, args=[input.bug_id, "pending_verification"],
+                        start_to_close_timeout=timedelta(seconds=10),
+                    )
 
             # ── Always wait for dev feedback before looping ───────────────────
             self._state = WorkflowState.AWAITING_DEV
-            dev_arrived = await workflow.wait_condition(
-                lambda: self._close_requested or self._dev_takeover or len(self._message_queue) > 0,
+            await workflow.wait_condition(
+                lambda: self._close_requested or self._dev_takeover or any(
+                    m.sender_type == "developer" for m in self._message_queue
+                ),
                 timeout=timedelta(hours=48),
             )
             self._state = WorkflowState.INVESTIGATING
@@ -317,8 +344,11 @@ class BugInvestigationWorkflow:
                 await self._handle_close(input)
                 return {"fix_type": "closed_by_reporter", "bug_id": input.bug_id}
 
-            if not dev_arrived:
-                # 48-hour timeout with no reply — auto-resolve
+            # Check the actual queue state — wait_condition return value is unreliable
+            # across SDK versions and can be None even when the condition was met.
+            dev_has_messages = any(m.sender_type == "developer" for m in self._message_queue)
+            if not dev_has_messages:
+                # 48-hour timeout with no dev reply — auto-resolve
                 await workflow.execute_activity(
                     update_bug_status, args=[input.bug_id, "resolved"],
                     start_to_close_timeout=timedelta(seconds=10),
@@ -330,9 +360,7 @@ class BugInvestigationWorkflow:
                 )
                 return investigation_dict
 
-            # Mark that a dev (or anyone) has now replied at least once.
-            # From this point, action=="resolved" from the agent means the dev
-            # explicitly asked to close and the agent confirmed it.
+            # A developer has replied — drain only their messages and continue.
             self._dev_replied = True
 
             # Drain queue — only the messages since last agent turn are passed
@@ -340,14 +368,14 @@ class BugInvestigationWorkflow:
             conversation_ids = [m.conversation_id for m in self._message_queue]
             self._message_queue.clear()
 
-            await workflow.execute_activity(
-                post_slack_message,
-                PostMessageInput(
-                    channel_id=input.channel_id, thread_ts=input.thread_ts,
-                    text=f":mag: Follow-up investigation started for {input.bug_id}...",
-                ),
-                start_to_close_timeout=timedelta(seconds=15),
-            )
+            # await workflow.execute_activity(
+            #     post_slack_message,
+            #     PostMessageInput(
+            #         channel_id=input.channel_id, thread_ts=input.thread_ts,
+            #         text=f":mag: Follow-up investigation started for {input.bug_id}...",
+            #     ),
+            #     start_to_close_timeout=timedelta(seconds=15),
+            # )
 
             investigation_dict = await workflow.execute_activity(
                 run_continuation_investigation,
@@ -399,12 +427,12 @@ class BugInvestigationWorkflow:
         # logged via the incoming_message signal → DB path, but we don't feed
         # them to Claude. 7-day timeout acts as a safety net.
         self._state = WorkflowState.DEV_TAKEOVER
-        close_arrived = await workflow.wait_condition(
+        await workflow.wait_condition(
             lambda: self._close_requested,
             timeout=timedelta(days=7),
         )
 
-        if close_arrived:
+        if self._close_requested:
             await self._handle_close(input)
         else:
             # 7-day safety-net timeout — auto-resolve

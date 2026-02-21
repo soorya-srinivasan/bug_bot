@@ -123,8 +123,7 @@ def format_triage_response(triage: dict, bug_id: str) -> str:
 
     return (
         f":mag: *Bug Bot* received this report (`{bug_id}`).\n"
-        f"*Severity:* `{severity}` | *Category:* `{category}`\n"
-        f"*Affected services:* {services_str}\n"
+        f"*Severity:* `{severity}`\n"
         f"*Summary:* {summary}\n"
         f"I'm starting an investigation and will update this thread."
     )
