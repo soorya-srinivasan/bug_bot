@@ -23,6 +23,14 @@ def build_continuation_prompt(bug_id: str, conversation_ids: list[str], state: s
         )
     elif state == "awaiting_dev":
         instruction += (
+            f" If the developer's message is NOT relevant to the current bug (e.g. general "
+            "knowledge questions, off-topic chatter, math problems, or anything unrelated to "
+            "the bug being investigated), do NOT answer it. Instead, set your summary to a "
+            "polite message like: 'That question doesn't appear to be related to this bug "
+            f"investigation. I can only assist with issues related to {bug_id}. Please ask "
+            "your question in the relevant channel.' Set action='escalate' so the workflow "
+            "keeps waiting for a relevant developer response. Do NOT run any tools or "
+            "investigation for irrelevant messages."
             " If a developer message asks for a fix or PR, proceed with creating it. "
             "Set action='resolved' ONLY when the developer explicitly asks to close or resolve this bug "
             "(e.g. 'please close this', 'mark it as resolved', 'close the bug'). "

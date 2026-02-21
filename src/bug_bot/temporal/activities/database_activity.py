@@ -4,6 +4,7 @@ from temporalio import activity
 
 from bug_bot.db.session import async_session
 from bug_bot.db.repository import BugRepository
+from bug_bot.oncall import service as oncall_service
 
 
 @activity.defn
@@ -71,6 +72,15 @@ async def fetch_oncall_for_services(service_names: list[str]) -> list[dict]:
 
 
 @activity.defn
+async def save_followup_result(bug_id: str, trigger_state: str, result: dict) -> None:
+    """Save follow-up investigation results to the database."""
+    async with async_session() as session:
+        repo = BugRepository(session)
+        await repo.save_followup_investigation(bug_id, trigger_state, result)
+    activity.logger.info(f"Follow-up investigation saved for {bug_id} (state={trigger_state})")
+
+
+@activity.defn
 async def log_conversation_event(
     bug_id: str,
     message_type: str,
@@ -119,3 +129,25 @@ async def mark_bug_auto_closed(bug_id: str) -> None:
             metadata={"reason": "auto_close_inactivity"},
         )
     activity.logger.info(f"Bug {bug_id} auto-closed (direct path)")
+
+
+@activity.defn
+async def fetch_rotation_enabled_teams() -> list[dict]:
+    """Return lightweight dicts for all rotation-enabled teams."""
+    async with async_session() as session:
+        teams = await BugRepository(session).get_rotation_enabled_teams()
+    activity.logger.info(f"Found {len(teams)} rotation-enabled teams")
+    return [{"id": str(t.id), "slack_group_id": t.slack_group_id} for t in teams]
+
+
+@activity.defn
+async def process_team_rotation(team_id: str) -> dict:
+    """Run auto-rotation for a single team, catching errors so one failure doesn't block others."""
+    try:
+        async with async_session() as session:
+            repo = BugRepository(session)
+            rotated = await oncall_service.process_auto_rotation(repo, team_id)
+        return {"team_id": team_id, "rotated": rotated}
+    except Exception as e:
+        activity.logger.error(f"Rotation failed for team {team_id}: {e}")
+        return {"team_id": team_id, "rotated": False, "error": str(e)}

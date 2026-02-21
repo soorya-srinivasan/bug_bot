@@ -24,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         update_bug_status,
         update_bug_assignee,
         save_investigation_result,
+        save_followup_result,
         store_summary_thread_ts,
         log_conversation_event,
         fetch_oncall_for_services,
@@ -193,12 +194,22 @@ class BugInvestigationWorkflow:
                     heartbeat_timeout=timedelta(minutes=2),
                     retry_policy=_AGENT_RETRY,
                 )
+                await workflow.execute_activity(
+                    save_followup_result,
+                    args=[input.bug_id, WorkflowState.AWAITING_REPORTER.value, investigation_dict],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
                 claude_session_id = investigation_dict.get("claude_session_id", claude_session_id)
                 action = investigation_dict.get("action", "post_findings")
                 continue
 
             # ── Dev follow-up: reply in the existing summary thread ────────
             if self._dev_replied and self._summary_thread_created:
+                await workflow.execute_activity(
+                    save_followup_result,
+                    args=[input.bug_id, WorkflowState.AWAITING_DEV.value, investigation_dict],
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
                 await workflow.execute_activity(
                     log_conversation_event,
                     args=[input.bug_id, "investigation_result", "bot", "bugbot", None,

@@ -204,6 +204,32 @@ async def get_bug(bug_id: str):
         investigation = await repo.get_investigation(bug_id)
         if not investigation:
             return {"error": "not_found", "bug_id": bug_id}
+        messages = await repo.get_investigation_messages(
+            bug_id, investigation_id=str(investigation.id),
+        )
+        followups = await repo.get_followup_investigations(bug_id)
+        followup_items = []
+        for f in followups:
+            f_messages = await repo.get_investigation_messages(bug_id, followup_id=str(f.id))
+            followup_items.append({
+                "id": str(f.id),
+                "trigger_state": f.trigger_state,
+                "action": f.action,
+                "fix_type": f.fix_type,
+                "summary": f.summary,
+                "confidence": f.confidence,
+                "root_cause": f.root_cause,
+                "pr_url": f.pr_url,
+                "recommended_actions": f.recommended_actions,
+                "relevant_services": f.relevant_services,
+                "cost_usd": f.cost_usd,
+                "duration_ms": f.duration_ms,
+                "messages": [
+                    {"sequence": m.sequence, "message_type": m.message_type, "content": m.content}
+                    for m in f_messages
+                ],
+                "created_at": f.created_at.isoformat(),
+            })
         return {
             "bug_id": bug_id,
             "summary": investigation.summary,
@@ -213,5 +239,9 @@ async def get_bug(bug_id: str):
             "pr_url": investigation.pr_url,
             "relevant_services": investigation.relevant_services,
             "recommended_actions": investigation.recommended_actions,
-            "conversation_history": investigation.conversation_history,
+            "messages": [
+                {"sequence": m.sequence, "message_type": m.message_type, "content": m.content}
+                for m in messages
+            ],
+            "followups": followup_items,
         }

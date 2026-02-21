@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bug_bot.models.models import (
     BugReport, BugConversation, Investigation, SLAConfig, Escalation,
-    ServiceTeamMapping, InvestigationFinding, Team,
-    OnCallSchedule, OnCallHistory
+    ServiceTeamMapping, InvestigationFinding, InvestigationMessage,
+    InvestigationFollowup, Team, OnCallSchedule, OnCallHistory
 )
 
 
@@ -153,6 +153,7 @@ class BugRepository:
         return result.scalar_one_or_none()
 
     async def save_investigation(self, bug_id: str, result: dict) -> Investigation:
+        conversation_history = result.get("conversation_history")
         investigation = Investigation(
             bug_id=bug_id,
             root_cause=result.get("root_cause"),
@@ -164,13 +165,47 @@ class BugRepository:
             recommended_actions=result.get("recommended_actions", []),
             cost_usd=result.get("cost_usd"),
             duration_ms=result.get("duration_ms"),
-            conversation_history=result.get("conversation_history"),
             summary_thread_ts=result.get("summary_thread_ts"),
             claude_session_id=result.get("claude_session_id"),
         )
         self.session.add(investigation)
+        await self.session.flush()
+
+        self._bulk_insert_messages(
+            bug_id, conversation_history,
+            investigation_id=investigation.id,
+        )
+
         await self.session.commit()
         return investigation
+
+    def _bulk_insert_messages(
+        self,
+        bug_id: str,
+        conversation_history: list[dict] | None,
+        *,
+        investigation_id=None,
+        followup_id=None,
+    ) -> None:
+        if not conversation_history:
+            return
+        messages = []
+        seq = 0
+        for msg in conversation_history:
+            content = msg.get("text")
+            if not content or not content.strip():
+                continue
+            messages.append(InvestigationMessage(
+                bug_id=bug_id,
+                investigation_id=investigation_id,
+                followup_id=followup_id,
+                sequence=seq,
+                message_type=msg.get("type", "unknown"),
+                content=content,
+            ))
+            seq += 1
+        if messages:
+            self.session.add_all(messages)
 
     async def get_claude_session_id(self, bug_id: str) -> str | None:
         stmt = select(Investigation.claude_session_id).where(Investigation.bug_id == bug_id)
@@ -425,17 +460,6 @@ class BugRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def update_investigation_conversation(
-        self, bug_id: str, conversation_history: list[dict]
-    ) -> None:
-        stmt = (
-            update(Investigation)
-            .where(Investigation.bug_id == bug_id)
-            .values(conversation_history=conversation_history)
-        )
-        await self.session.execute(stmt)
-        await self.session.commit()
-
     async def store_summary_thread_ts(self, bug_id: str, summary_thread_ts: str) -> None:
         stmt = (
             update(Investigation)
@@ -520,6 +544,63 @@ class BugRepository:
             .where(InvestigationFinding.bug_id == bug_id)
             .order_by(InvestigationFinding.created_at)
         )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def save_followup_investigation(
+        self, bug_id: str, trigger_state: str, result: dict
+    ) -> InvestigationFollowup:
+        conversation_history = result.get("conversation_history")
+        followup = InvestigationFollowup(
+            bug_id=bug_id,
+            trigger_state=trigger_state,
+            action=result.get("action", "post_findings"),
+            fix_type=result.get("fix_type", "unknown"),
+            summary=result.get("summary", ""),
+            confidence=result.get("confidence", 0.0),
+            root_cause=result.get("root_cause"),
+            pr_url=result.get("pr_url"),
+            recommended_actions=result.get("recommended_actions", []),
+            relevant_services=result.get("relevant_services", []),
+            cost_usd=result.get("cost_usd"),
+            duration_ms=result.get("duration_ms"),
+        )
+        self.session.add(followup)
+        await self.session.flush()
+
+        self._bulk_insert_messages(
+            bug_id, conversation_history,
+            followup_id=followup.id,
+        )
+
+        await self.session.commit()
+        return followup
+
+    async def get_followup_investigations(self, bug_id: str) -> list[InvestigationFollowup]:
+        stmt = (
+            select(InvestigationFollowup)
+            .where(InvestigationFollowup.bug_id == bug_id)
+            .order_by(InvestigationFollowup.created_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_investigation_messages(
+        self,
+        bug_id: str,
+        *,
+        investigation_id: str | None = None,
+        followup_id: str | None = None,
+    ) -> list[InvestigationMessage]:
+        stmt = (
+            select(InvestigationMessage)
+            .where(InvestigationMessage.bug_id == bug_id)
+        )
+        if investigation_id is not None:
+            stmt = stmt.where(InvestigationMessage.investigation_id == investigation_id)
+        if followup_id is not None:
+            stmt = stmt.where(InvestigationMessage.followup_id == followup_id)
+        stmt = stmt.order_by(InvestigationMessage.sequence)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
@@ -796,6 +877,12 @@ class BugRepository:
             return team.rotation_order[next_idx]
 
         return None
+
+    async def get_rotation_enabled_teams(self) -> list[Team]:
+        """Return all teams that have rotation enabled."""
+        stmt = select(Team).where(Team.rotation_enabled == True)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
 
     # ── Dashboard Analytics ──────────────────────────────────────────────────
 

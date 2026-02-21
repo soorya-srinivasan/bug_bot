@@ -16,6 +16,7 @@ from temporalio.worker import Worker
 from bug_bot.config import settings
 from bug_bot.temporal.workflows.auto_closer import AutoCloseInput, AutoCloseWorkflow
 from bug_bot.temporal.workflows.bug_investigation import BugInvestigationWorkflow
+from bug_bot.temporal.workflows.oncall_rotation import OnCallRotationWorkflow
 from bug_bot.temporal.workflows.sla_tracking import SLATrackingWorkflow
 from bug_bot.temporal.activities.parsing_activity import parse_bug_report
 from bug_bot.temporal.activities.slack_activity import (
@@ -30,12 +31,15 @@ from bug_bot.temporal.activities.database_activity import (
     update_bug_status,
     update_bug_assignee,
     save_investigation_result,
+    save_followup_result,
     store_summary_thread_ts,
     get_sla_config_for_severity,
     log_conversation_event,
     fetch_oncall_for_services,
     find_stale_bugs,
     mark_bug_auto_closed,
+    fetch_rotation_enabled_teams,
+    process_team_rotation,
 )
 from bug_bot.temporal.activities.agent_activity import (
     run_agent_investigation,
@@ -45,6 +49,7 @@ from bug_bot.temporal.activities.agent_activity import (
 
 
 SCHEDULE_ID = "auto-close-hourly-schedule"
+ONCALL_ROTATION_SCHEDULE_ID = "oncall-rotation-daily-schedule"
 
 
 async def _ensure_auto_close_schedule(client: Client) -> None:
@@ -68,6 +73,26 @@ async def _ensure_auto_close_schedule(client: Client) -> None:
             raise
 
 
+async def _ensure_oncall_rotation_schedule(client: Client) -> None:
+    schedule = Schedule(
+        action=ScheduleActionStartWorkflow(
+            OnCallRotationWorkflow.run,
+            id="oncall-rotation-daily",
+            task_queue=settings.temporal_task_queue,
+        ),
+        spec=ScheduleSpec(intervals=[ScheduleIntervalSpec(every=timedelta(hours=24))]),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+    )
+    try:
+        await client.create_schedule(ONCALL_ROTATION_SCHEDULE_ID, schedule)
+        logging.info("On-call rotation schedule created")
+    except Exception as e:
+        if "already" in str(e).lower():
+            logging.info("On-call rotation schedule already exists, skipping")
+        else:
+            raise
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
 
@@ -77,6 +102,7 @@ async def main():
     )
 
     await _ensure_auto_close_schedule(client)
+    await _ensure_oncall_rotation_schedule(client)
 
     worker = Worker(
         client,
@@ -85,6 +111,7 @@ async def main():
             BugInvestigationWorkflow,
             SLATrackingWorkflow,
             AutoCloseWorkflow,
+            OnCallRotationWorkflow,
         ],
         activities=[
             parse_bug_report,
@@ -97,6 +124,7 @@ async def main():
             update_bug_status,
             update_bug_assignee,
             save_investigation_result,
+            save_followup_result,
             store_summary_thread_ts,
             get_sla_config_for_severity,
             run_agent_investigation,
@@ -106,6 +134,8 @@ async def main():
             fetch_oncall_for_services,
             find_stale_bugs,
             mark_bug_auto_closed,
+            fetch_rotation_enabled_teams,
+            process_team_rotation,
         ],
     )
 
