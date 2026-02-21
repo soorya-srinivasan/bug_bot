@@ -103,9 +103,9 @@ async def get_current_oncall(
     if check_date is None:
         check_date = date.today()
 
-    # Check active schedule
+    # Check active override or schedule
     current = await repo.get_current_oncall_for_team(team_id, check_date=check_date)
-    if current and current.get("source") == "schedule":
+    if current and current.get("source") in ("schedule", "override"):
         return current
 
     # Check rotation if enabled

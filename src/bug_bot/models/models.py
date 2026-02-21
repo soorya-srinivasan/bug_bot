@@ -122,6 +122,7 @@ class Team(Base):
     services: Mapped[list["ServiceTeamMapping"]] = relationship(back_populates="team")
     schedules: Mapped[list["OnCallSchedule"]] = relationship(back_populates="team", cascade="all, delete-orphan")
     history: Mapped[list["OnCallHistory"]] = relationship(back_populates="team", cascade="all, delete-orphan")
+    overrides: Mapped[list["OnCallOverride"]] = relationship(back_populates="team", cascade="all, delete-orphan")
 
 
 class ServiceTeamMapping(Base):
@@ -267,6 +268,27 @@ class OnCallSchedule(Base):
     __table_args__ = (
         Index("idx_oncall_schedules_team_start", "team_id", "start_date"),
         Index("idx_oncall_schedules_team_end", "team_id", "end_date"),
+    )
+
+
+class OnCallOverride(Base):
+    __tablename__ = "oncall_overrides"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False
+    )
+    override_date: Mapped[date] = mapped_column(Date, nullable=False)
+    end_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    substitute_engineer_slack_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    original_engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    team: Mapped["Team"] = relationship(back_populates="overrides")
+
+    __table_args__ = (
+        Index("idx_oncall_overrides_team_date", "team_id", "override_date"),
     )
 
 
