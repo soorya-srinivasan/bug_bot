@@ -127,6 +127,7 @@ def _validate_status_transition(current: str, new: str) -> None:
 async def list_bugs(
     *,
     repo: BugRepository = Depends(get_repo),
+    bug_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
     severity: str | None = Query(default=None),
     service: str | None = Query(default=None),
@@ -137,6 +138,7 @@ async def list_bugs(
     sort: str = Query("-created_at"),
 ):
     rows, total = await repo.list_bugs(
+        bug_id=bug_id,
         status=status,
         severity=severity,
         service=service,

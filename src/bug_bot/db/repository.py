@@ -67,6 +67,7 @@ class BugRepository:
     async def list_bugs(
         self,
         *,
+        bug_id: str | None = None,
         status: str | None = None,
         severity: str | None = None,
         service: str | None = None,
@@ -80,6 +81,8 @@ class BugRepository:
             Investigation, Investigation.bug_id == BugReport.bug_id, isouter=True
         )
 
+        if bug_id:
+            stmt = stmt.where(BugReport.bug_id.ilike(f"%{bug_id}%"))
         if status:
             stmt = stmt.where(BugReport.status == status)
         if severity:
