@@ -224,51 +224,260 @@ async def send_nudge(
         return str(exc)
 
 
-async def notify_oncall_rotation(
-    engineer_slack_id: str,
-    group_name: str,
+async def notify_team_channel_handoff(
+    slack_channel_id: str,
+    outgoing_id: str,
+    incoming_id: str,
     effective_date: date,
 ) -> bool:
-    """Send Slack notification about rotation assignment.
-    
+    """Post a handoff announcement to the team channel.
+
     Args:
-        engineer_slack_id: Slack user ID of the engineer
+        slack_channel_id: Slack channel ID to post in
+        outgoing_id: Slack user ID of the outgoing engineer
+        incoming_id: Slack user ID of the incoming engineer
+        effective_date: Date when the handoff takes effect
+
+    Returns:
+        True if message posted successfully, False otherwise
+    """
+    if not _slack_configured():
+        return False
+
+    message = (
+        f"\U0001f504 On-call handoff: <@{outgoing_id}> \u2192 <@{incoming_id}> "
+        f"effective {effective_date.strftime('%Y-%m-%d')}"
+    )
+
+    client = _get_slack_client()
+    try:
+        await client.chat_postMessage(
+            channel=slack_channel_id,
+            text=message,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "notify_team_channel_handoff: failed for channel %s", slack_channel_id
+        )
+        return False
+
+
+async def notify_outgoing_engineer(
+    engineer_id: str,
+    group_name: str,
+    effective_date: date,
+    incoming_id: str,
+) -> bool:
+    """DM the outgoing engineer that their on-call shift is ending.
+
+    Args:
+        engineer_id: Slack user ID of the outgoing engineer
         group_name: Name of the service group
-        effective_date: Date when rotation takes effect
-    
+        effective_date: Date when the shift ends
+        incoming_id: Slack user ID of the incoming engineer
+
     Returns:
         True if notification sent successfully, False otherwise
     """
     if not _slack_configured():
         return False
-    
-    # Get user info
-    user_info = await get_user_info(engineer_slack_id)
-    
-    # Build message
+
     message = (
-        f"🔄 *On-Call Rotation*\n\n"
-        f"You've been rotated to on-call engineer for *{group_name}*\n"
-        f"Effective: {effective_date.strftime('%Y-%m-%d')}\n\n"
-        f"Please ensure you're available and monitor alerts."
+        f"Your on-call shift for {group_name} ends "
+        f"{effective_date.strftime('%Y-%m-%d')}. "
+        f"<@{incoming_id}> is taking over."
     )
-    
+
     client = _get_slack_client()
     try:
-        # Open DM channel with user
-        dm_response = await client.conversations_open(users=[engineer_slack_id])
+        dm_response = await client.conversations_open(users=[engineer_id])
         if not dm_response.get("ok"):
             return False
-        
+
         channel_id = dm_response.get("channel", {}).get("id")
         if not channel_id:
             return False
-        
-        # Send message
+
         await client.chat_postMessage(
             channel=channel_id,
             text=message,
         )
         return True
     except Exception:
+        logger.exception(
+            "notify_outgoing_engineer: failed for %s", engineer_id
+        )
+        return False
+
+
+async def notify_override_request(
+    requested_by_id: str,
+    substitute_id: str,
+    team_channel_id: str,
+    override_date: date,
+    reason: str,
+) -> bool:
+    """Post an override request to the team channel for visibility.
+
+    Args:
+        requested_by_id: Slack user ID of the person requesting the override
+        substitute_id: Slack user ID of the proposed substitute
+        team_channel_id: Slack channel ID to post in
+        override_date: Date of the requested override
+        reason: Reason for the override request
+
+    Returns:
+        True if message posted successfully, False otherwise
+    """
+    if not _slack_configured():
+        return False
+
+    message = (
+        f"\U0001f4cb *On-Call Override Request*\n\n"
+        f"<@{requested_by_id}> has requested an override for "
+        f"*{override_date.strftime('%Y-%m-%d')}*.\n"
+        f"Proposed substitute: <@{substitute_id}>\n"
+        f"Reason: {reason}\n\n"
+        f"A team lead can approve or reject this request."
+    )
+
+    client = _get_slack_client()
+    try:
+        await client.chat_postMessage(
+            channel=team_channel_id,
+            text=message,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "notify_override_request: failed for channel %s", team_channel_id
+        )
+        return False
+
+
+async def notify_override_decision(
+    requested_by_id: str,
+    substitute_id: str,
+    decision: str,
+    decided_by_id: str,
+) -> bool:
+    """DM the requester about the outcome of their override request.
+
+    Args:
+        requested_by_id: Slack user ID of the person who requested the override
+        substitute_id: Slack user ID of the proposed substitute
+        decision: 'approved' or 'rejected'
+        decided_by_id: Slack user ID of the person who made the decision
+
+    Returns:
+        True if notification sent successfully, False otherwise
+    """
+    if not _slack_configured():
+        return False
+
+    status = "approved \u2705" if decision == "approved" else "rejected \u274c"
+    message = (
+        f"Your on-call override request (substitute: <@{substitute_id}>) "
+        f"has been *{status}* by <@{decided_by_id}>."
+    )
+
+    client = _get_slack_client()
+    try:
+        dm_response = await client.conversations_open(users=[requested_by_id])
+        if not dm_response.get("ok"):
+            return False
+
+        channel_id = dm_response.get("channel", {}).get("id")
+        if not channel_id:
+            return False
+
+        await client.chat_postMessage(
+            channel=channel_id,
+            text=message,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "notify_override_decision: failed for %s", requested_by_id
+        )
+        return False
+
+
+async def notify_oncall_rotation(
+    engineer_slack_id: str,
+    group_name: str,
+    effective_date: date,
+    slack_channel_id: str | None = None,
+    outgoing_engineer_slack_id: str | None = None,
+) -> bool:
+    """Send Slack notification about rotation assignment.
+
+    When ``slack_channel_id`` and ``outgoing_engineer_slack_id`` are provided
+    the function will also post a handoff message to the team channel and DM
+    the outgoing engineer about their shift ending.
+
+    Args:
+        engineer_slack_id: Slack user ID of the incoming engineer
+        group_name: Name of the service group
+        effective_date: Date when rotation takes effect
+        slack_channel_id: Optional team channel to announce the handoff in
+        outgoing_engineer_slack_id: Optional Slack user ID of the outgoing engineer
+
+    Returns:
+        True if the primary DM notification sent successfully, False otherwise
+    """
+    if not _slack_configured():
+        return False
+
+    # Get user info
+    user_info = await get_user_info(engineer_slack_id)
+
+    # Build message
+    message = (
+        f"\U0001f504 *On-Call Rotation*\n\n"
+        f"You've been rotated to on-call engineer for *{group_name}*\n"
+        f"Effective: {effective_date.strftime('%Y-%m-%d')}\n\n"
+        f"Please ensure you're available and monitor alerts."
+    )
+
+    client = _get_slack_client()
+    try:
+        # Open DM channel with user
+        dm_response = await client.conversations_open(users=[engineer_slack_id])
+        if not dm_response.get("ok"):
+            return False
+
+        channel_id = dm_response.get("channel", {}).get("id")
+        if not channel_id:
+            return False
+
+        # Send message
+        await client.chat_postMessage(
+            channel=channel_id,
+            text=message,
+        )
+
+        # If team channel and outgoing engineer are known, send supplementary
+        # notifications.  Failures here are logged but do not affect the return
+        # value — the primary DM to the incoming engineer already succeeded.
+        if slack_channel_id and outgoing_engineer_slack_id:
+            await notify_team_channel_handoff(
+                slack_channel_id=slack_channel_id,
+                outgoing_id=outgoing_engineer_slack_id,
+                incoming_id=engineer_slack_id,
+                effective_date=effective_date,
+            )
+            await notify_outgoing_engineer(
+                engineer_id=outgoing_engineer_slack_id,
+                group_name=group_name,
+                effective_date=effective_date,
+                incoming_id=engineer_slack_id,
+            )
+
+        return True
+    except Exception:
+        logger.exception(
+            "notify_oncall_rotation: failed for %s", engineer_slack_id
+        )
         return False

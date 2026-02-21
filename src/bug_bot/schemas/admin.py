@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime, date, time
 from typing import Literal
 
 from pydantic import BaseModel, Field, NonNegativeInt
@@ -173,35 +173,54 @@ class TeamBase(BaseModel):
 
 
 class TeamCreate(TeamBase):
-    pass
+    name: str                    # Display name (required)
+    description: str | None = None
+    slack_channel_id: str | None = None
 
 
 class TeamUpdate(BaseModel):
-    oncall_engineer: str | None = None  # only oncall_engineer is mutable after creation
+    oncall_engineer: str | None = None
+    name: str | None = None
+    description: str | None = None
+    slack_channel_id: str | None = None
 
 
 class TeamRotationConfigUpdate(BaseModel):
     rotation_enabled: bool | None = None
-    rotation_type: Literal["round_robin", "custom_order"] | None = None
+    rotation_type: Literal["round_robin", "custom_order", "weighted"] | None = None
     rotation_order: list[str] | None = None
     rotation_start_date: date | None = None
+    rotation_interval: Literal["daily", "weekly", "biweekly"] | None = None
+    handoff_day: int | None = Field(default=None, ge=0, le=6)
+    handoff_time: time | None = None
 
 
 class TeamRotationConfig(BaseModel):
     rotation_enabled: bool = False
-    rotation_type: Literal["round_robin", "custom_order"] | None = None
-    rotation_order: list[str] | None = None  # array of Slack user IDs for custom_order
+    rotation_type: Literal["round_robin", "custom_order", "weighted"] | None = None
+    rotation_order: list[str] | None = None
     rotation_start_date: date | None = None
     current_rotation_index: int | None = None
+    rotation_interval: Literal["daily", "weekly", "biweekly"] = "weekly"
+    handoff_day: int | None = None
+    handoff_time: time | None = None
 
 
 class TeamResponse(TeamBase):
     id: str
+    name: str
+    slug: str
+    description: str | None = None
+    slack_channel_id: str | None = None
     rotation_enabled: bool = False
-    rotation_type: Literal["round_robin", "custom_order"] | None = None
+    rotation_type: Literal["round_robin", "custom_order", "weighted"] | None = None
     rotation_order: list[str] | None = None
     rotation_start_date: date | None = None
     current_rotation_index: int | None = None
+    rotation_interval: str = "weekly"
+    handoff_day: int | None = None
+    handoff_time: time | None = None
+    is_active: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -215,7 +234,8 @@ class PaginatedTeams(BaseModel):
 
 class TeamSummary(BaseModel):
     id: str
-    slack_group_id: str       # Slack user group ID — look up name/handle via GET /slack/user-groups
+    slack_group_id: str
+    name: str | None = None
     oncall_engineer: str | None
 
 
@@ -228,6 +248,10 @@ class ServiceTeamMappingBase(BaseModel):
     description: str | None = None
     service_owner: str | None = None
     team_id: str | None = None
+    repository_url: str | None = None
+    environment: str | None = None
+    tier: Literal["critical", "standard", "low"] | None = None
+    metadata: dict | None = None
 
 
 class ServiceTeamMappingCreate(ServiceTeamMappingBase):
@@ -243,12 +267,17 @@ class ServiceTeamMappingUpdate(BaseModel):
     description: str | None = None
     service_owner: str | None = None
     team_id: str | None = None
+    repository_url: str | None = None
+    environment: str | None = None
+    tier: Literal["critical", "standard", "low"] | None = None
+    metadata: dict | None = None
 
 
 class ServiceTeamMappingResponse(ServiceTeamMappingBase):
     id: str
+    is_active: bool = True
     created_at: datetime
-    team: TeamSummary | None = None  # populated when team_id is set
+    team: TeamSummary | None = None
 
 
 class PaginatedServiceTeamMappings(BaseModel):
@@ -340,6 +369,7 @@ class OnCallScheduleUpdate(BaseModel):
 class OnCallScheduleResponse(OnCallScheduleBase):
     id: str
     team_id: str
+    origin: str = "manual"
     created_by: str
     created_at: datetime
     updated_at: datetime
@@ -397,6 +427,9 @@ class OnCallOverrideResponse(BaseModel):
     substitute_engineer_slack_id: str
     original_engineer_slack_id: str | None
     reason: str
+    status: str = "approved"
+    requested_by: str | None = None
+    approved_by: str | None = None
     created_by: str
     created_at: datetime
 
@@ -536,4 +569,93 @@ class DashboardResponse(BaseModel):
     findings_by_category: list[CategoryCount] = []
     findings_by_severity: list[FindingSeverityCount] = []
     recent_bugs: list[RecentBugItem] = []
+
+
+# --- Team Membership ---
+
+
+class TeamMembershipResponse(BaseModel):
+    id: str | None
+    team_id: str
+    slack_user_id: str
+    team_role: str = "member"
+    is_eligible_for_oncall: bool = True
+    weight: float = 1.0
+    joined_at: datetime | None = None
+    display_name: str | None = None
+    in_db: bool = True
+
+
+class TeamMembershipUpsert(BaseModel):
+    slack_user_id: str
+    team_role: Literal["lead", "member"] | None = None
+    is_eligible_for_oncall: bool | None = None
+    weight: float | None = Field(default=None, gt=0)
+
+
+class TeamMembershipUpdate(BaseModel):
+    team_role: Literal["lead", "member"] | None = None
+    is_eligible_for_oncall: bool | None = None
+    weight: float | None = Field(default=None, gt=0)
+
+
+# --- OnCall Audit Log ---
+
+
+class OnCallAuditLogResponse(BaseModel):
+    id: str
+    team_id: str | None
+    entity_type: str
+    entity_id: str
+    action: str
+    actor_type: str = "user"
+    actor_id: str | None = None
+    changes: dict | None = None
+    metadata: dict | None = None
+    created_at: datetime
+
+
+class PaginatedOnCallAuditLogs(BaseModel):
+    items: list[OnCallAuditLogResponse]
+    total: NonNegativeInt
+    page: int
+    page_size: int
+
+
+# --- Override Status Update ---
+
+
+class OverrideStatusUpdate(BaseModel):
+    status: Literal["approved", "rejected", "cancelled"]
+    approved_by: str | None = None
+
+
+# --- Rotation Preview ---
+
+
+class RotationPreviewEntry(BaseModel):
+    week_number: int
+    start_date: date
+    end_date: date
+    engineer_slack_id: str
+    engineer_display_name: str | None = None
+
+
+class RotationPreviewResponse(BaseModel):
+    items: list[RotationPreviewEntry]
+
+
+class RotationGenerateRequest(BaseModel):
+    weeks: int = Field(4, ge=1, le=12)
+
+
+# --- Global On-Call Lookup ---
+
+
+class GlobalOnCallResponse(BaseModel):
+    engineer_slack_id: str | None
+    team_id: str | None = None
+    team_name: str | None = None
+    service_name: str | None = None
+    source: str | None = None
 

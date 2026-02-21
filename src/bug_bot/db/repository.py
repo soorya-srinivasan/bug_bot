@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bug_bot.models.models import (
     BugReport, BugConversation, BugAuditLog, Investigation, SLAConfig, Escalation,
     ServiceTeamMapping, InvestigationFinding, InvestigationMessage,
-    InvestigationFollowup, Team, OnCallSchedule, OnCallHistory, OnCallOverride
+    InvestigationFollowup, Team, TeamMembership, OnCallSchedule, OnCallHistory,
+    OnCallOverride, OnCallAuditLog,
 )
 
 
@@ -329,6 +330,9 @@ class BugRepository:
         *,
         service_name: str | None = None,
         tech_stack: str | None = None,
+        is_active: bool | None = True,
+        team_id: str | None = None,
+        tier: str | None = None,
         page: int = 1,
         page_size: int = 50,
     ) -> tuple[list[ServiceTeamMapping], int]:
@@ -337,6 +341,12 @@ class BugRepository:
             stmt = stmt.where(ServiceTeamMapping.service_name.ilike(f"%{service_name}%"))
         if tech_stack:
             stmt = stmt.where(ServiceTeamMapping.tech_stack == tech_stack)
+        if is_active is not None:
+            stmt = stmt.where(ServiceTeamMapping.is_active == is_active)
+        if team_id:
+            stmt = stmt.where(ServiceTeamMapping.team_id == team_id)  # type: ignore[arg-type]
+        if tier:
+            stmt = stmt.where(ServiceTeamMapping.tier == tier)
 
         total = await self.session.execute(
             stmt.with_only_columns(func.count()).order_by(None)
@@ -344,7 +354,12 @@ class BugRepository:
         total_count = int(total.scalar_one())
 
         offset = (page - 1) * page_size
-        stmt = stmt.order_by(ServiceTeamMapping.service_name).offset(offset).limit(page_size)
+        stmt = (
+            stmt.options(selectinload(ServiceTeamMapping.team))
+            .order_by(ServiceTeamMapping.service_name)
+            .offset(offset)
+            .limit(page_size)
+        )
         result = await self.session.execute(stmt)
         return list(result.scalars().all()), total_count
 
@@ -378,16 +393,32 @@ class BugRepository:
         return result.scalar_one_or_none()
 
     async def delete_service_mapping(self, id_: str) -> None:
-        # Hard delete is fine here; mappings can be recreated.
-        mapping = await self.get_service_mapping_by_id(id_)
-        if mapping is None:
-            return
-        await self.session.delete(mapping)
+        """Soft delete a service mapping by setting is_active=False."""
+        stmt = (
+            update(ServiceTeamMapping)
+            .where(ServiceTeamMapping.id == id_)  # type: ignore[arg-type]
+            .values(is_active=False)
+        )
+        await self.session.execute(stmt)
         await self.session.commit()
 
     # ── Team CRUD ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _generate_slug(name: str) -> str:
+        """Generate a URL-safe slug from a name."""
+        import re
+        slug = name.lower().strip()
+        slug = re.sub(r'[^a-z0-9]+', '-', slug)
+        return slug.strip('-')
+
     async def create_team(self, data: dict) -> Team:
+        # Auto-generate name from slack_group_id if not provided
+        if "name" not in data or not data["name"]:
+            data["name"] = data.get("slack_group_id", "unnamed")
+        # Auto-generate slug from name if not provided
+        if "slug" not in data or not data["slug"]:
+            data["slug"] = self._generate_slug(data["name"])
         team = Team(**data)
         self.session.add(team)
         await self.session.commit()
@@ -399,10 +430,17 @@ class BugRepository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_team_by_slug(self, slug: str) -> Team | None:
+        stmt = select(Team).where(Team.slug == slug)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def list_teams(
-        self, *, page: int = 1, page_size: int = 50
+        self, *, is_active: bool = True, page: int = 1, page_size: int = 50
     ) -> tuple[list[Team], int]:
         stmt: Select = select(Team)
+        if is_active is not None:
+            stmt = stmt.where(Team.is_active == is_active)
         total = await self.session.execute(
             stmt.with_only_columns(func.count()).order_by(None)
         )
@@ -415,6 +453,9 @@ class BugRepository:
     async def update_team(self, id_: str, data: dict) -> Team | None:
         if not data:
             return await self.get_team_by_id(id_)
+        # If name changed, regenerate slug unless slug is explicitly provided
+        if "name" in data and "slug" not in data:
+            data["slug"] = self._generate_slug(data["name"])
         stmt = (
             update(Team)
             .where(Team.id == id_)  # type: ignore[arg-type]
@@ -426,10 +467,13 @@ class BugRepository:
         return result.scalar_one_or_none()
 
     async def delete_team(self, id_: str) -> None:
-        team = await self.get_team_by_id(id_)
-        if team is None:
-            return
-        await self.session.delete(team)
+        """Soft delete a team by setting is_active=False."""
+        stmt = (
+            update(Team)
+            .where(Team.id == id_)  # type: ignore[arg-type]
+            .values(is_active=False, updated_at=datetime.now(timezone.utc))
+        )
+        await self.session.execute(stmt)
         await self.session.commit()
 
     async def get_oncall_for_services(
@@ -904,6 +948,7 @@ class BugRepository:
         change_reason: str | None = None,
         changed_by: str | None = None,
     ) -> OnCallHistory:
+        # Write to legacy oncall_history table
         history = OnCallHistory(
             team_id=team_id,
             engineer_slack_id=engineer_slack_id,
@@ -914,6 +959,41 @@ class BugRepository:
             changed_by=changed_by,
         )
         self.session.add(history)
+
+        # Dual-write to oncall_audit_logs
+        change_type_to_action = {
+            "manual": "updated",
+            "auto_rotation": "rotation_triggered",
+            "schedule_created": "created",
+            "schedule_updated": "updated",
+            "schedule_deleted": "deleted",
+            "override_created": "created",
+            "override_deleted": "deleted",
+        }
+        change_type_to_entity = {
+            "manual": "team",
+            "auto_rotation": "team",
+            "schedule_created": "schedule",
+            "schedule_updated": "schedule",
+            "schedule_deleted": "schedule",
+            "override_created": "override",
+            "override_deleted": "override",
+        }
+        audit_entry = OnCallAuditLog(
+            team_id=team_id,
+            entity_type=change_type_to_entity.get(change_type, "team"),
+            entity_id=team_id,
+            action=change_type_to_action.get(change_type, change_type),
+            actor_type="user" if changed_by else "system",
+            actor_id=changed_by,
+            engineer_slack_id=engineer_slack_id,
+            previous_engineer_slack_id=previous_engineer_slack_id,
+            change_type=change_type,
+            change_reason=change_reason,
+            effective_date=effective_date,
+        )
+        self.session.add(audit_entry)
+
         await self.session.commit()
         await self.session.refresh(history)
         return history
@@ -964,8 +1044,8 @@ class BugRepository:
         return None
 
     async def get_rotation_enabled_teams(self) -> list[Team]:
-        """Return all teams that have rotation enabled."""
-        stmt = select(Team).where(Team.rotation_enabled == True)
+        """Return all active teams that have rotation enabled."""
+        stmt = select(Team).where(Team.rotation_enabled == True, Team.is_active == True)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
@@ -974,13 +1054,14 @@ class BugRepository:
     async def get_active_override_for_team(
         self, team_id: str, check_date: date | None = None
     ) -> OnCallOverride | None:
-        """Get active override for a team on a specific date."""
+        """Get active override for a team on a specific date. Only considers approved overrides."""
         if check_date is None:
             check_date = date.today()
         stmt = (
             select(OnCallOverride)
             .where(
                 OnCallOverride.team_id == team_id,  # type: ignore[arg-type]
+                OnCallOverride.status == "approved",
                 OnCallOverride.override_date <= check_date,
                 or_(
                     # Single-day override: end_date is NULL and override_date matches
@@ -1050,10 +1131,11 @@ class BugRepository:
         end_date: date | None = None,
         exclude_id: str | None = None,
     ) -> bool:
-        """Check if an override overlaps with existing overrides for the team."""
+        """Check if an override overlaps with existing non-cancelled/rejected overrides for the team."""
         effective_end = end_date if end_date is not None else override_date
         stmt = select(OnCallOverride).where(
             OnCallOverride.team_id == team_id,  # type: ignore[arg-type]
+            OnCallOverride.status.in_(["pending", "approved"]),
             or_(
                 # Existing single-day overlaps with new range
                 and_(
@@ -1259,3 +1341,304 @@ class BugRepository:
             "findings_by_severity": findings_by_severity,
             "recent_bugs": recent_bugs,
         }
+
+    # ── Team Membership CRUD ──────────────────────────────────────────────────
+
+    async def list_team_memberships(self, team_id: str) -> list[TeamMembership]:
+        stmt = (
+            select(TeamMembership)
+            .where(TeamMembership.team_id == team_id)  # type: ignore[arg-type]
+            .order_by(TeamMembership.joined_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def upsert_team_membership(
+        self, team_id: str, slack_user_id: str, data: dict
+    ) -> TeamMembership:
+        stmt = select(TeamMembership).where(
+            TeamMembership.team_id == team_id,  # type: ignore[arg-type]
+            TeamMembership.slack_user_id == slack_user_id,
+        )
+        result = await self.session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if existing:
+            for k, v in data.items():
+                if v is not None:
+                    setattr(existing, k, v)
+            await self.session.commit()
+            await self.session.refresh(existing)
+            return existing
+        membership = TeamMembership(
+            team_id=team_id, slack_user_id=slack_user_id, **data
+        )
+        self.session.add(membership)
+        await self.session.commit()
+        await self.session.refresh(membership)
+        return membership
+
+    async def delete_team_membership(self, team_id: str, slack_user_id: str) -> None:
+        stmt = select(TeamMembership).where(
+            TeamMembership.team_id == team_id,  # type: ignore[arg-type]
+            TeamMembership.slack_user_id == slack_user_id,
+        )
+        result = await self.session.execute(stmt)
+        existing = result.scalar_one_or_none()
+        if existing:
+            await self.session.delete(existing)
+            await self.session.commit()
+
+    async def get_eligible_members_for_rotation(
+        self, team_id: str
+    ) -> list[TeamMembership]:
+        stmt = (
+            select(TeamMembership)
+            .where(
+                TeamMembership.team_id == team_id,  # type: ignore[arg-type]
+                TeamMembership.is_eligible_for_oncall == True,
+            )
+            .order_by(TeamMembership.joined_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def merge_slack_members_with_db(
+        self, team_id: str, slack_user_ids: list[str]
+    ) -> list[dict]:
+        """Merge Slack group members with DB metadata. Members in Slack but not DB get defaults."""
+        db_memberships = await self.list_team_memberships(team_id)
+        db_map = {m.slack_user_id: m for m in db_memberships}
+        merged = []
+        for uid in slack_user_ids:
+            if uid in db_map:
+                m = db_map[uid]
+                merged.append({
+                    "id": str(m.id),
+                    "slack_user_id": m.slack_user_id,
+                    "team_role": m.team_role,
+                    "is_eligible_for_oncall": m.is_eligible_for_oncall,
+                    "weight": m.weight,
+                    "joined_at": m.joined_at.isoformat() if m.joined_at else None,
+                    "in_db": True,
+                })
+            else:
+                merged.append({
+                    "id": None,
+                    "slack_user_id": uid,
+                    "team_role": "member",
+                    "is_eligible_for_oncall": True,
+                    "weight": 1.0,
+                    "joined_at": None,
+                    "in_db": False,
+                })
+        return merged
+
+    # ── Override Status Transitions ───────────────────────────────────────────
+
+    async def update_oncall_override(
+        self, override_id: str, data: dict
+    ) -> OnCallOverride | None:
+        if not data:
+            return await self.get_oncall_override_by_id(override_id)
+        stmt = (
+            update(OnCallOverride)
+            .where(OnCallOverride.id == override_id)  # type: ignore[arg-type]
+            .values(**data)
+            .returning(OnCallOverride)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return result.scalar_one_or_none()
+
+    # ── OnCall Audit Log ──────────────────────────────────────────────────────
+
+    async def create_oncall_audit_log(
+        self,
+        entity_type: str,
+        entity_id: str,
+        action: str,
+        *,
+        actor_type: str = "user",
+        actor_id: str | None = None,
+        changes: dict | None = None,
+        metadata: dict | None = None,
+        team_id: str | None = None,
+        engineer_slack_id: str | None = None,
+        previous_engineer_slack_id: str | None = None,
+        change_type: str | None = None,
+        change_reason: str | None = None,
+        effective_date: date | None = None,
+    ) -> OnCallAuditLog:
+        entry = OnCallAuditLog(
+            team_id=team_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            action=action,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            changes=changes,
+            metadata_=metadata,
+            engineer_slack_id=engineer_slack_id,
+            previous_engineer_slack_id=previous_engineer_slack_id,
+            change_type=change_type,
+            change_reason=change_reason,
+            effective_date=effective_date,
+        )
+        self.session.add(entry)
+        await self.session.commit()
+        await self.session.refresh(entry)
+        return entry
+
+    async def list_oncall_audit_logs(
+        self,
+        *,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        action: str | None = None,
+        actor_id: str | None = None,
+        team_id: str | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[OnCallAuditLog], int]:
+        stmt: Select = select(OnCallAuditLog)
+        if entity_type:
+            stmt = stmt.where(OnCallAuditLog.entity_type == entity_type)
+        if entity_id:
+            stmt = stmt.where(OnCallAuditLog.entity_id == entity_id)  # type: ignore[arg-type]
+        if action:
+            stmt = stmt.where(OnCallAuditLog.action == action)
+        if actor_id:
+            stmt = stmt.where(OnCallAuditLog.actor_id == actor_id)
+        if team_id:
+            stmt = stmt.where(OnCallAuditLog.team_id == team_id)  # type: ignore[arg-type]
+        if from_date:
+            stmt = stmt.where(cast(OnCallAuditLog.created_at, Date) >= from_date)
+        if to_date:
+            stmt = stmt.where(cast(OnCallAuditLog.created_at, Date) <= to_date)
+
+        total = await self.session.execute(
+            stmt.with_only_columns(func.count()).order_by(None)
+        )
+        total_count = int(total.scalar_one())
+
+        offset = (page - 1) * page_size
+        stmt = (
+            stmt.order_by(desc(OnCallAuditLog.created_at))
+            .offset(offset)
+            .limit(page_size)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total_count
+
+    # ── Schedule helpers ──────────────────────────────────────────────────────
+
+    async def delete_future_auto_schedules(
+        self, team_id: str, from_date: date | None = None
+    ) -> int:
+        """Delete origin='auto' schedules with start_date >= from_date. Returns count deleted."""
+        if from_date is None:
+            from_date = date.today()
+        stmt = (
+            select(OnCallSchedule)
+            .where(
+                OnCallSchedule.team_id == team_id,  # type: ignore[arg-type]
+                OnCallSchedule.origin == "auto",
+                OnCallSchedule.start_date >= from_date,
+            )
+        )
+        result = await self.session.execute(stmt)
+        schedules = list(result.scalars().all())
+        for s in schedules:
+            await self.session.delete(s)
+        if schedules:
+            await self.session.commit()
+        return len(schedules)
+
+    async def get_user_schedules(
+        self, slack_user_id: str, from_date: date | None = None, to_date: date | None = None
+    ) -> list[OnCallSchedule]:
+        """Get all schedules across teams for a given user."""
+        stmt = (
+            select(OnCallSchedule)
+            .where(OnCallSchedule.engineer_slack_id == slack_user_id)
+        )
+        if from_date:
+            stmt = stmt.where(OnCallSchedule.end_date >= from_date)
+        if to_date:
+            stmt = stmt.where(OnCallSchedule.start_date <= to_date)
+        stmt = stmt.order_by(OnCallSchedule.start_date)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_service_oncall(self, service_id: str) -> dict | None:
+        """Get current on-call for a specific service."""
+        mapping = await self.get_service_mapping_by_id(service_id)
+        if not mapping or not mapping.team_id:
+            if mapping and mapping.primary_oncall:
+                return {
+                    "engineer_slack_id": mapping.primary_oncall,
+                    "team_id": None,
+                    "team_name": None,
+                    "service_name": mapping.service_name,
+                    "source": "service_primary",
+                }
+            return None
+        current = await self.get_current_oncall_for_team(str(mapping.team_id))
+        if not current:
+            return None
+        team = await self.get_team_by_id(str(mapping.team_id))
+        return {
+            "engineer_slack_id": current.get("engineer_slack_id"),
+            "team_id": str(mapping.team_id),
+            "team_name": team.name if team else None,
+            "service_name": mapping.service_name,
+            "source": current.get("source"),
+        }
+
+    async def global_oncall_lookup(
+        self, *, service_name: str | None = None, team_name: str | None = None
+    ) -> list[dict]:
+        """Convenience lookup: who is on-call for a service or team?"""
+        results = []
+        if service_name:
+            mapping = await self.get_service_mapping(service_name)
+            if mapping:
+                oncall = await self.get_service_oncall(str(mapping.id))
+                if oncall:
+                    results.append(oncall)
+        if team_name:
+            # Try slug first, then name
+            team = await self.get_team_by_slug(team_name)
+            if not team:
+                stmt = select(Team).where(Team.name.ilike(f"%{team_name}%"), Team.is_active == True)
+                result = await self.session.execute(stmt)
+                team = result.scalar_one_or_none()
+            if team:
+                current = await self.get_current_oncall_for_team(str(team.id))
+                if current:
+                    results.append({
+                        "engineer_slack_id": current.get("engineer_slack_id"),
+                        "team_id": str(team.id),
+                        "team_name": team.name,
+                        "service_name": None,
+                        "source": current.get("source"),
+                    })
+        return results
+
+    async def get_shift_counts_for_team(self, team_id: str) -> dict[str, int]:
+        """Count completed oncall schedules per engineer for a team (for weighted rotation)."""
+        stmt = (
+            select(
+                OnCallSchedule.engineer_slack_id,
+                func.count().label("cnt"),
+            )
+            .where(
+                OnCallSchedule.team_id == team_id,  # type: ignore[arg-type]
+                OnCallSchedule.end_date < date.today(),
+            )
+            .group_by(OnCallSchedule.engineer_slack_id)
+        )
+        result = await self.session.execute(stmt)
+        return {row[0]: row[1] for row in result.all()}

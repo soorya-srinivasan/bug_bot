@@ -139,15 +139,13 @@ claude --resume 9a9fab63-e2a7-4509-b71f-2c316b4d4a4c
 
 
 
-* Auto close scheduled job: -> done
+Create a plan for Auto close scheduled job:
     which runs every 1 hour once and close the bugs which are in open state and without any interaction from both dev and reporter side in the last 5 (keep this configurable in env) days
     Cleanup workspace created if present
     Check if this can be implemented in temporal itself
-* Dev takeover -> done and tested
-* Fix the filtering part -> done
-* Only reply to slack after starting the workflow -> done
-
-
+* Dev takeover -> done (yet)
+* Fix the filtering part -> remove it
+* Only reply to slack after starting the workflow
 * Guardrails and prompt tuning
     * should not do anything outside the workspace
     * should only clone the required codebases
@@ -161,23 +159,7 @@ Do not close the workflow, close the workflow only when asked to close explicitl
 just add a conversations log or an entry in some other suitable and update the status of the required tables to proper states if not done already,
 if the workflow is active, you can follow the smae existing flow. Ask clarifying questions if you have any doubt and do not assume things
 
-Oncall rotation -> scheduled job
-Fix bot scope
-On priority update, push slack message to bug reports
-On every edit, add to audit logs with action, payload and, performed by
-On dev reply, case is getting resolved-> check and fix it
-Sla -> Nudging workflow needs to be completed
-Ignore messages on a closed case
 
-Stop Guardrails -> only dev can ask to stop the investigation, that is take over
-or influence how investigation should be done, replies from bug reports are just information and should not instruct the agent on how to do things
-
-Remove category from triage -> done
-Formatting of questions -> done
-Ignore messages, if workflow resolved already -> done
-On call rotation
-
-Dev reply fix
-Test closure from both the threads
-Test dev take-over
-Remove periodic Nudging or fix it properly
+* Wathq
+* Cross service problems
+* Repo mappings, can it be done in some other way -> RAG???
