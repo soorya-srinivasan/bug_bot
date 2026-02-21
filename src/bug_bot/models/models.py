@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, time
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, Date, ForeignKey, Index
+from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, Date, Time, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -105,16 +105,22 @@ class Team(Base):
     __tablename__ = "teams"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    # Slack user group ID (from GET /slack/user-groups) — source of team identity.
-    # Names and handles come from the Slack API; we don't duplicate them here.
     slack_group_id: Mapped[str] = mapped_column(String(30), unique=True, nullable=False)
-    oncall_engineer: Mapped[str | None] = mapped_column(String(20))  # Slack user ID
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    slack_channel_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    oncall_engineer: Mapped[str | None] = mapped_column(String(20))
     # Rotation configuration
     rotation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    rotation_type: Mapped[str | None] = mapped_column(String(20))  # 'round_robin' | 'custom_order'
-    rotation_order: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # array of Slack user IDs
+    rotation_type: Mapped[str | None] = mapped_column(String(20))  # 'round_robin' | 'custom_order' | 'weighted'
+    rotation_order: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     rotation_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     current_rotation_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rotation_interval: Mapped[str] = mapped_column(String(10), default="weekly", nullable=False)  # 'daily' | 'weekly' | 'biweekly'
+    handoff_day: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 0=Mon, 6=Sun
+    handoff_time: Mapped[time | None] = mapped_column(Time, nullable=True)  # UTC
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -123,6 +129,28 @@ class Team(Base):
     schedules: Mapped[list["OnCallSchedule"]] = relationship(back_populates="team", cascade="all, delete-orphan")
     history: Mapped[list["OnCallHistory"]] = relationship(back_populates="team", cascade="all, delete-orphan")
     overrides: Mapped[list["OnCallOverride"]] = relationship(back_populates="team", cascade="all, delete-orphan")
+    memberships: Mapped[list["TeamMembership"]] = relationship(back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMembership(Base):
+    __tablename__ = "team_memberships"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=False
+    )
+    slack_user_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    team_role: Mapped[str] = mapped_column(String(10), default="member", nullable=False)  # 'lead' | 'member'
+    is_eligible_for_oncall: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    weight: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    team: Mapped["Team"] = relationship(back_populates="memberships")
+
+    __table_args__ = (
+        UniqueConstraint("team_id", "slack_user_id", name="uq_team_memberships_team_user"),
+        Index("idx_team_memberships_team_id", "team_id"),
+    )
 
 
 class ServiceTeamMapping(Base):
@@ -135,10 +163,15 @@ class ServiceTeamMapping(Base):
     team_slack_group: Mapped[str | None] = mapped_column(String(30))
     primary_oncall: Mapped[str | None] = mapped_column(String(20))
     tech_stack: Mapped[str] = mapped_column(String(20), nullable=False)
-    service_owner: Mapped[str | None] = mapped_column(String(20))  # permanent tech owner Slack ID
+    service_owner: Mapped[str | None] = mapped_column(String(20))
     team_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True
     )
+    repository_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    environment: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    tier: Mapped[str | None] = mapped_column(String(20), nullable=True)  # 'critical' | 'standard' | 'low'
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     team: Mapped["Team | None"] = relationship(back_populates="services")
 
@@ -153,8 +186,6 @@ class BugConversation(Base):
     sender_id: Mapped[str | None] = mapped_column(String(50))
     message_text: Mapped[str | None] = mapped_column(Text)
     message_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    # message_type values: bug_report | clarification_request | clarification_response |
-    #   reporter_context | dev_reply | investigation_result | pr_created | resolved | status_update
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -169,9 +200,9 @@ class BugAuditLog(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
-    action: Mapped[str] = mapped_column(String(30), nullable=False)        # priority_updated | dev_takeover | bug_closed
-    source: Mapped[str] = mapped_column(String(20), nullable=False)        # admin_panel | slack | api | system
-    performed_by: Mapped[str | None] = mapped_column(String(50), nullable=True)  # Slack user ID or None
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    performed_by: Mapped[str | None] = mapped_column(String(50), nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -188,10 +219,8 @@ class InvestigationFinding(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     bug_id: Mapped[str] = mapped_column(String(50), ForeignKey("bug_reports.bug_id"), nullable=False)
     category: Mapped[str] = mapped_column(String(50), nullable=False)
-    # category examples: "error_rate", "db_anomaly", "service_health", "metric", "log_pattern"
     finding: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(String(10), nullable=False)
-    # severity at tool level: "low" | "medium" | "high" | "critical"
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -257,8 +286,9 @@ class OnCallSchedule(Base):
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     schedule_type: Mapped[str] = mapped_column(String(10), nullable=False)  # 'weekly' | 'daily'
-    days_of_week: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # array of day numbers [0-6] for daily schedules
-    created_by: Mapped[str] = mapped_column(String(20), nullable=False)  # Slack user ID
+    days_of_week: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    origin: Mapped[str] = mapped_column(String(10), default="manual", nullable=False)  # 'auto' | 'manual'
+    created_by: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -283,6 +313,9 @@ class OnCallOverride(Base):
     substitute_engineer_slack_id: Mapped[str] = mapped_column(String(20), nullable=False)
     original_engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="approved", nullable=False)  # 'pending' | 'approved' | 'rejected' | 'cancelled'
+    requested_by: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    approved_by: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_by: Mapped[str] = mapped_column(String(20), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     team: Mapped["Team"] = relationship(back_populates="overrides")
@@ -301,16 +334,46 @@ class OnCallHistory(Base):
     )
     engineer_slack_id: Mapped[str] = mapped_column(String(20), nullable=False)
     previous_engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    change_type: Mapped[str] = mapped_column(String(20), nullable=False)  # 'manual' | 'auto_rotation' | 'schedule_created' | 'schedule_updated' | 'schedule_deleted'
+    change_type: Mapped[str] = mapped_column(String(20), nullable=False)
     change_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     effective_date: Mapped[date] = mapped_column(Date, nullable=False)
-    changed_by: Mapped[str | None] = mapped_column(String(20), nullable=True)  # Slack user ID (null for auto-rotation)
+    changed_by: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     team: Mapped["Team"] = relationship(back_populates="history")
 
     __table_args__ = (
         Index("idx_oncall_history_team_effective", "team_id", "effective_date"),
         Index("idx_oncall_history_team_created", "team_id", "created_at"),
+    )
+
+
+class OnCallAuditLog(Base):
+    __tablename__ = "oncall_audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id"), nullable=True
+    )
+    entity_type: Mapped[str] = mapped_column(String(30), nullable=False)  # 'team'|'service'|'schedule'|'override'|'rotation_config'|'team_membership'
+    entity_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    action: Mapped[str] = mapped_column(String(30), nullable=False)  # 'created'|'updated'|'deleted'|'rotation_triggered'|'override_approved'|...
+    actor_type: Mapped[str] = mapped_column(String(10), default="user", nullable=False)  # 'user'|'system'
+    actor_id: Mapped[str | None] = mapped_column(String(20), nullable=True)  # Slack user ID
+    changes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {"field": {"old": X, "new": Y}}
+    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    # Legacy compat columns
+    engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    previous_engineer_slack_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    change_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    change_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    effective_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_oncall_audit_logs_entity", "entity_type", "entity_id"),
+        Index("idx_oncall_audit_logs_team_id", "team_id"),
+        Index("idx_oncall_audit_logs_action", "action"),
+        Index("idx_oncall_audit_logs_created_at", "created_at"),
     )
 
 
