@@ -35,6 +35,34 @@ async def store_embeddings(
     return count
 
 
+async def lookup_by_bug_id(
+    session: AsyncSession,
+    bug_id: str,
+) -> list[dict]:
+    """Return all indexed documents for a specific bug ID (exact match)."""
+    stmt = text(
+        "SELECT id, source_type, source_id, chunk_text, chunk_metadata "
+        "FROM rag_documents "
+        "WHERE source_id = :bug_id OR source_id LIKE :bug_id_prefix "
+        "ORDER BY source_type"
+    )
+    result = await session.execute(
+        stmt, {"bug_id": bug_id, "bug_id_prefix": f"{bug_id}:%"}
+    )
+    rows = result.fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "source_type": row[1],
+            "source_id": row[2],
+            "chunk_text": row[3],
+            "chunk_metadata": row[4],
+            "similarity": 1.0,
+        }
+        for row in rows
+    ]
+
+
 async def similarity_search(
     session: AsyncSession,
     query_embedding: list[float],

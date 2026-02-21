@@ -4,6 +4,7 @@ from datetime import datetime, date
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.exc import ProgrammingError
 
 from bug_bot.db.repository import BugRepository
 from bug_bot.db.session import async_session
@@ -512,24 +513,41 @@ async def get_bug_conversations(bug_id: str, repo: BugRepository = Depends(get_r
 
 @router.get("/bugs/{bug_id}/audit-logs", response_model=AuditLogListResponse)
 async def get_bug_audit_logs(bug_id: str, repo: BugRepository = Depends(get_repo)):
-    bug = await repo.get_bug_by_id(bug_id)
-    if bug is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
-    rows = await repo.get_audit_logs(bug_id)
-    items = [
-        AuditLogResponse(
-            id=str(a.id),
-            bug_id=a.bug_id,
-            action=a.action,
-            source=a.source,
-            performed_by=a.performed_by,
-            payload=a.payload,
-            metadata=a.metadata_,
-            created_at=a.created_at,
-        )
-        for a in rows
-    ]
-    return AuditLogListResponse(items=items, total=len(items))
+    try:
+        bug = await repo.get_bug_by_id(bug_id)
+        if bug is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bug not found")
+        rows = await repo.get_audit_logs(bug_id)
+        items = [
+            AuditLogResponse(
+                id=str(a.id),
+                bug_id=a.bug_id,
+                action=a.action,
+                source=a.source,
+                performed_by=a.performed_by,
+                payload=a.payload if isinstance(a.payload, dict) else None,
+                metadata=a.metadata_ if isinstance(a.metadata_, dict) else None,
+                created_at=a.created_at,
+            )
+            for a in rows
+        ]
+        return AuditLogListResponse(items=items, total=len(items))
+    except HTTPException:
+        raise
+    except ProgrammingError as e:
+        if "bug_audit_logs" in str(e) and "does not exist" in str(e).lower():
+            return AuditLogListResponse(items=[], total=0)
+        logger.exception("get_bug_audit_logs failed for bug_id=%s", bug_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.exception("get_bug_audit_logs failed for bug_id=%s", bug_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        ) from e
 
 
 @router.get("/bugs/{bug_id}/findings", response_model=InvestigationFindingListResponse)
@@ -1554,6 +1572,7 @@ class ChatSourceItem(BaseModel):
     source_type: str
     chunk_text: str
     similarity: float
+    link: str | None = None
 
 
 class ChatResponse(BaseModel):

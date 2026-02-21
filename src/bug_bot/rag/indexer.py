@@ -3,7 +3,7 @@ import logging
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bug_bot.models.models import BugReport, Investigation, InvestigationFinding
+from bug_bot.models.models import BugReport, Investigation, InvestigationFinding, ServiceTeamMapping, Team
 from bug_bot.rag.embeddings import embed_texts
 from bug_bot.rag.vectorstore import store_embeddings, delete_by_source
 
@@ -52,6 +52,61 @@ def _build_finding_chunk(finding: InvestigationFinding) -> str:
         f"Severity: {finding.severity}\n"
         f"Finding: {finding.finding}"
     )
+
+
+def _build_service_mapping_chunk(mapping: ServiceTeamMapping, team: Team | None = None) -> str:
+    """Build a text chunk from a service-team mapping."""
+    parts = [
+        f"Service: {mapping.service_name}",
+        f"GitHub Repo: {mapping.github_repo}",
+        f"Tech Stack: {mapping.tech_stack}",
+    ]
+    if mapping.description:
+        parts.append(f"Description: {mapping.description}")
+    if mapping.service_owner:
+        parts.append(f"Service Owner (Slack ID): {mapping.service_owner}")
+    if mapping.primary_oncall:
+        parts.append(f"Primary On-Call (Slack ID): {mapping.primary_oncall}")
+    if mapping.team_slack_group:
+        parts.append(f"Team Slack Group: {mapping.team_slack_group}")
+    if team and team.oncall_engineer:
+        parts.append(f"Current Team On-Call (Slack ID): {team.oncall_engineer}")
+    return "\n".join(parts)
+
+
+async def index_service_mapping(session: AsyncSession, service_name: str) -> int:
+    """Index (or re-index) a single service-team mapping."""
+    from sqlalchemy.orm import selectinload
+
+    stmt = (
+        select(ServiceTeamMapping)
+        .options(selectinload(ServiceTeamMapping.team))
+        .where(ServiceTeamMapping.service_name == service_name)
+    )
+    result = await session.execute(stmt)
+    mapping = result.scalar_one_or_none()
+    if not mapping:
+        logger.warning("Service mapping %s not found for indexing", service_name)
+        return 0
+
+    source_id = f"service:{mapping.service_name}"
+    await delete_by_source(session, "service_mapping", source_id)
+
+    chunk_text = _build_service_mapping_chunk(mapping, mapping.team)
+    embeddings = embed_texts([chunk_text])
+
+    docs = [{
+        "source_type": "service_mapping",
+        "source_id": source_id,
+        "chunk_text": chunk_text,
+        "chunk_metadata": {
+            "service_name": mapping.service_name,
+            "tech_stack": mapping.tech_stack,
+            "github_repo": mapping.github_repo,
+        },
+        "embedding": embeddings[0],
+    }]
+    return await store_embeddings(session, docs)
 
 
 async def index_bug_report(session: AsyncSession, bug_id: str) -> int:
@@ -143,8 +198,8 @@ async def index_finding(session: AsyncSession, finding_id: str) -> int:
 
 
 async def reindex_all(session: AsyncSession) -> dict:
-    """Re-index all bug reports, investigations, and findings."""
-    stats = {"bug_reports": 0, "investigations": 0, "findings": 0}
+    """Re-index all bug reports, investigations, findings, and service mappings."""
+    stats = {"bug_reports": 0, "investigations": 0, "findings": 0, "service_mappings": 0}
 
     bugs_q = await session.execute(select(BugReport))
     bugs = list(bugs_q.scalars().all())
@@ -216,6 +271,34 @@ async def reindex_all(session: AsyncSession) -> dict:
                 "embedding": emb,
             })
         stats["findings"] = await store_embeddings(session, docs)
+
+    from sqlalchemy.orm import selectinload
+
+    mappings_q = await session.execute(
+        select(ServiceTeamMapping).options(selectinload(ServiceTeamMapping.team))
+    )
+    mappings = list(mappings_q.scalars().all())
+    logger.info("Re-indexing %d service mappings", len(mappings))
+
+    if mappings:
+        chunks = [_build_service_mapping_chunk(m, m.team) for m in mappings]
+        embeddings = embed_texts(chunks)
+        docs = []
+        for mapping, emb in zip(mappings, embeddings):
+            source_id = f"service:{mapping.service_name}"
+            await delete_by_source(session, "service_mapping", source_id)
+            docs.append({
+                "source_type": "service_mapping",
+                "source_id": source_id,
+                "chunk_text": _build_service_mapping_chunk(mapping, mapping.team),
+                "chunk_metadata": {
+                    "service_name": mapping.service_name,
+                    "tech_stack": mapping.tech_stack,
+                    "github_repo": mapping.github_repo,
+                },
+                "embedding": emb,
+            })
+        stats["service_mappings"] = await store_embeddings(session, docs)
 
     total = sum(stats.values())
     logger.info("Re-indexing complete: %d total documents", total)
