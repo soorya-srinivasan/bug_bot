@@ -1,7 +1,8 @@
 import logging
 
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from bug_bot.models.models import BugReport, Investigation, InvestigationFinding, ServiceTeamMapping, Team
 from bug_bot.rag.embeddings import embed_texts
@@ -10,19 +11,35 @@ from bug_bot.rag.vectorstore import store_embeddings, delete_by_source
 logger = logging.getLogger(__name__)
 
 
-def _build_bug_report_chunk(bug: BugReport) -> str:
-    """Build a single text chunk from a bug report."""
-    parts = [
-        f"Bug ID: {bug.bug_id}",
-        f"Severity: {bug.severity}",
-        f"Status: {bug.status}",
-        f"Report: {bug.original_message}",
-    ]
-    return "\n".join(parts)
+# ---------------------------------------------------------------------------
+# Contextual Retrieval: each builder returns (context_prefix, chunk_body).
+# The prefix adds document-level context so the embedding captures richer
+# semantics.  We embed ``f"{prefix}\n\n{body}"``, store *body* in
+# ``chunk_text`` (for display), and store *prefix* in ``context_prefix``.
+# ---------------------------------------------------------------------------
 
 
-def _build_investigation_chunk(inv: Investigation) -> str:
-    """Build a text chunk from an investigation result."""
+def _build_bug_report_enriched(bug: BugReport) -> tuple[str, str]:
+    prefix = (
+        f"This is a bug report (ID: {bug.bug_id}) with severity {bug.severity}, "
+        f"status {bug.status}. It was reported in the ShopTech bug tracking system."
+    )
+    body = (
+        f"Bug ID: {bug.bug_id}\n"
+        f"Severity: {bug.severity}\n"
+        f"Status: {bug.status}\n"
+        f"Report: {bug.original_message}"
+    )
+    return prefix, body
+
+
+def _build_investigation_enriched(inv: Investigation) -> tuple[str, str]:
+    services_str = ", ".join(str(s) for s in inv.relevant_services) if inv.relevant_services else "unknown"
+    prefix = (
+        f"This is an investigation result for bug {inv.bug_id}. "
+        f"The fix type is {inv.fix_type} with confidence {inv.confidence}. "
+        f"Services involved: {services_str}."
+    )
     parts = [
         f"Bug ID: {inv.bug_id}",
         f"Summary: {inv.summary}",
@@ -41,21 +58,31 @@ def _build_investigation_chunk(inv: Investigation) -> str:
             parts.append(f"Services: {', '.join(str(s) for s in services)}")
     if inv.pr_url:
         parts.append(f"PR: {inv.pr_url}")
-    return "\n".join(parts)
+    body = "\n".join(parts)
+    return prefix, body
 
 
-def _build_finding_chunk(finding: InvestigationFinding) -> str:
-    """Build a text chunk from an investigation finding."""
-    return (
+def _build_finding_enriched(finding: InvestigationFinding) -> tuple[str, str]:
+    prefix = (
+        f"This is an investigation finding for bug {finding.bug_id}, "
+        f"category: {finding.category}, severity: {finding.severity}."
+    )
+    body = (
         f"Bug ID: {finding.bug_id}\n"
         f"Category: {finding.category}\n"
         f"Severity: {finding.severity}\n"
         f"Finding: {finding.finding}"
     )
+    return prefix, body
 
 
-def _build_service_mapping_chunk(mapping: ServiceTeamMapping, team: Team | None = None) -> str:
-    """Build a text chunk from a service-team mapping."""
+def _build_service_mapping_enriched(
+    mapping: ServiceTeamMapping, team: Team | None = None,
+) -> tuple[str, str]:
+    prefix = (
+        f"This is a service mapping for {mapping.service_name} "
+        f"({mapping.tech_stack} stack, repo: {mapping.github_repo})."
+    )
     parts = [
         f"Service: {mapping.service_name}",
         f"GitHub Repo: {mapping.github_repo}",
@@ -71,13 +98,115 @@ def _build_service_mapping_chunk(mapping: ServiceTeamMapping, team: Team | None 
         parts.append(f"Team Slack Group: {mapping.team_slack_group}")
     if team and team.oncall_engineer:
         parts.append(f"Current Team On-Call (Slack ID): {team.oncall_engineer}")
-    return "\n".join(parts)
+    body = "\n".join(parts)
+    return prefix, body
+
+
+# ---------------------------------------------------------------------------
+# Single-document indexers
+# ---------------------------------------------------------------------------
+
+
+async def index_bug_report(session: AsyncSession, bug_id: str) -> int:
+    stmt = select(BugReport).where(BugReport.bug_id == bug_id)
+    result = await session.execute(stmt)
+    bug = result.scalar_one_or_none()
+    if not bug:
+        logger.warning("Bug %s not found for indexing", bug_id)
+        return 0
+
+    await delete_by_source(session, "bug_report", bug_id)
+
+    prefix, body = _build_bug_report_enriched(bug)
+    embeddings = embed_texts([f"{prefix}\n\n{body}"])
+
+    docs = [{
+        "source_type": "bug_report",
+        "source_id": bug_id,
+        "chunk_text": body,
+        "context_prefix": prefix,
+        "chunk_metadata": {
+            "severity": bug.severity,
+            "status": bug.status,
+            "created_at": bug.created_at.isoformat() if bug.created_at else None,
+        },
+        "embedding": embeddings[0],
+        "severity": bug.severity,
+        "status": bug.status,
+        "created_date": bug.created_at.date() if bug.created_at else None,
+    }]
+    return await store_embeddings(session, docs)
+
+
+async def index_investigation(session: AsyncSession, bug_id: str) -> int:
+    stmt = select(Investigation).where(Investigation.bug_id == bug_id)
+    result = await session.execute(stmt)
+    inv = result.scalar_one_or_none()
+    if not inv:
+        logger.warning("Investigation for %s not found for indexing", bug_id)
+        return 0
+
+    await delete_by_source(session, "investigation", bug_id)
+
+    prefix, body = _build_investigation_enriched(inv)
+    embeddings = embed_texts([f"{prefix}\n\n{body}"])
+
+    first_service = None
+    if inv.relevant_services and isinstance(inv.relevant_services, list) and inv.relevant_services:
+        first_service = str(inv.relevant_services[0])
+
+    docs = [{
+        "source_type": "investigation",
+        "source_id": bug_id,
+        "chunk_text": body,
+        "context_prefix": prefix,
+        "chunk_metadata": {
+            "fix_type": inv.fix_type,
+            "confidence": inv.confidence,
+            "services": inv.relevant_services,
+            "created_at": inv.created_at.isoformat() if inv.created_at else None,
+        },
+        "embedding": embeddings[0],
+        "service_name": first_service,
+        "created_date": inv.created_at.date() if inv.created_at else None,
+    }]
+    return await store_embeddings(session, docs)
+
+
+async def index_finding(session: AsyncSession, finding_id: str) -> int:
+    stmt = select(InvestigationFinding).where(
+        InvestigationFinding.id == finding_id  # type: ignore[arg-type]
+    )
+    result = await session.execute(stmt)
+    finding = result.scalar_one_or_none()
+    if not finding:
+        logger.warning("Finding %s not found for indexing", finding_id)
+        return 0
+
+    source_id = f"{finding.bug_id}:{finding_id}"
+    await delete_by_source(session, "finding", source_id)
+
+    prefix, body = _build_finding_enriched(finding)
+    embeddings = embed_texts([f"{prefix}\n\n{body}"])
+
+    docs = [{
+        "source_type": "finding",
+        "source_id": source_id,
+        "chunk_text": body,
+        "context_prefix": prefix,
+        "chunk_metadata": {
+            "bug_id": finding.bug_id,
+            "category": finding.category,
+            "severity": finding.severity,
+        },
+        "embedding": embeddings[0],
+        "severity": finding.severity,
+        "created_date": finding.created_at.date() if hasattr(finding, "created_at") and finding.created_at else None,
+    }]
+    return await store_embeddings(session, docs)
 
 
 async def index_service_mapping(session: AsyncSession, service_name: str) -> int:
-    """Index (or re-index) a single service-team mapping."""
-    from sqlalchemy.orm import selectinload
-
     stmt = (
         select(ServiceTeamMapping)
         .options(selectinload(ServiceTeamMapping.team))
@@ -92,152 +221,83 @@ async def index_service_mapping(session: AsyncSession, service_name: str) -> int
     source_id = f"service:{mapping.service_name}"
     await delete_by_source(session, "service_mapping", source_id)
 
-    chunk_text = _build_service_mapping_chunk(mapping, mapping.team)
-    embeddings = embed_texts([chunk_text])
+    prefix, body = _build_service_mapping_enriched(mapping, mapping.team)
+    embeddings = embed_texts([f"{prefix}\n\n{body}"])
 
     docs = [{
         "source_type": "service_mapping",
         "source_id": source_id,
-        "chunk_text": chunk_text,
+        "chunk_text": body,
+        "context_prefix": prefix,
         "chunk_metadata": {
             "service_name": mapping.service_name,
             "tech_stack": mapping.tech_stack,
             "github_repo": mapping.github_repo,
         },
         "embedding": embeddings[0],
+        "service_name": mapping.service_name,
     }]
     return await store_embeddings(session, docs)
 
 
-async def index_bug_report(session: AsyncSession, bug_id: str) -> int:
-    """Index (or re-index) a single bug report."""
-    stmt = select(BugReport).where(BugReport.bug_id == bug_id)
-    result = await session.execute(stmt)
-    bug = result.scalar_one_or_none()
-    if not bug:
-        logger.warning("Bug %s not found for indexing", bug_id)
-        return 0
-
-    await delete_by_source(session, "bug_report", bug_id)
-
-    chunk_text = _build_bug_report_chunk(bug)
-    embeddings = embed_texts([chunk_text])
-
-    docs = [{
-        "source_type": "bug_report",
-        "source_id": bug_id,
-        "chunk_text": chunk_text,
-        "chunk_metadata": {
-            "severity": bug.severity,
-            "status": bug.status,
-            "created_at": bug.created_at.isoformat() if bug.created_at else None,
-        },
-        "embedding": embeddings[0],
-    }]
-    return await store_embeddings(session, docs)
-
-
-async def index_investigation(session: AsyncSession, bug_id: str) -> int:
-    """Index (or re-index) an investigation result."""
-    stmt = select(Investigation).where(Investigation.bug_id == bug_id)
-    result = await session.execute(stmt)
-    inv = result.scalar_one_or_none()
-    if not inv:
-        logger.warning("Investigation for %s not found for indexing", bug_id)
-        return 0
-
-    await delete_by_source(session, "investigation", bug_id)
-
-    chunk_text = _build_investigation_chunk(inv)
-    embeddings = embed_texts([chunk_text])
-
-    docs = [{
-        "source_type": "investigation",
-        "source_id": bug_id,
-        "chunk_text": chunk_text,
-        "chunk_metadata": {
-            "fix_type": inv.fix_type,
-            "confidence": inv.confidence,
-            "services": inv.relevant_services,
-            "created_at": inv.created_at.isoformat() if inv.created_at else None,
-        },
-        "embedding": embeddings[0],
-    }]
-    return await store_embeddings(session, docs)
-
-
-async def index_finding(session: AsyncSession, finding_id: str) -> int:
-    """Index a single investigation finding."""
-    stmt = select(InvestigationFinding).where(
-        InvestigationFinding.id == finding_id  # type: ignore[arg-type]
-    )
-    result = await session.execute(stmt)
-    finding = result.scalar_one_or_none()
-    if not finding:
-        logger.warning("Finding %s not found for indexing", finding_id)
-        return 0
-
-    source_id = f"{finding.bug_id}:{finding_id}"
-    await delete_by_source(session, "finding", source_id)
-
-    chunk_text = _build_finding_chunk(finding)
-    embeddings = embed_texts([chunk_text])
-
-    docs = [{
-        "source_type": "finding",
-        "source_id": source_id,
-        "chunk_text": chunk_text,
-        "chunk_metadata": {
-            "bug_id": finding.bug_id,
-            "category": finding.category,
-            "severity": finding.severity,
-        },
-        "embedding": embeddings[0],
-    }]
-    return await store_embeddings(session, docs)
+# ---------------------------------------------------------------------------
+# Bulk re-index
+# ---------------------------------------------------------------------------
 
 
 async def reindex_all(session: AsyncSession) -> dict:
     """Re-index all bug reports, investigations, findings, and service mappings."""
     stats = {"bug_reports": 0, "investigations": 0, "findings": 0, "service_mappings": 0}
 
+    # Bug reports
     bugs_q = await session.execute(select(BugReport))
     bugs = list(bugs_q.scalars().all())
     logger.info("Re-indexing %d bug reports", len(bugs))
 
     if bugs:
-        chunks = [_build_bug_report_chunk(b) for b in bugs]
-        embeddings = embed_texts(chunks)
+        enriched = [_build_bug_report_enriched(b) for b in bugs]
+        full_texts = [f"{prefix}\n\n{body}" for prefix, body in enriched]
+        embeddings = embed_texts(full_texts)
         docs = []
-        for bug, emb in zip(bugs, embeddings):
+        for bug, (prefix, body), emb in zip(bugs, enriched, embeddings):
             await delete_by_source(session, "bug_report", bug.bug_id)
             docs.append({
                 "source_type": "bug_report",
                 "source_id": bug.bug_id,
-                "chunk_text": _build_bug_report_chunk(bug),
+                "chunk_text": body,
+                "context_prefix": prefix,
                 "chunk_metadata": {
                     "severity": bug.severity,
                     "status": bug.status,
                     "created_at": bug.created_at.isoformat() if bug.created_at else None,
                 },
                 "embedding": emb,
+                "severity": bug.severity,
+                "status": bug.status,
+                "created_date": bug.created_at.date() if bug.created_at else None,
             })
         stats["bug_reports"] = await store_embeddings(session, docs)
 
+    # Investigations
     invs_q = await session.execute(select(Investigation))
     invs = list(invs_q.scalars().all())
     logger.info("Re-indexing %d investigations", len(invs))
 
     if invs:
-        chunks = [_build_investigation_chunk(inv) for inv in invs]
-        embeddings = embed_texts(chunks)
+        enriched = [_build_investigation_enriched(inv) for inv in invs]
+        full_texts = [f"{prefix}\n\n{body}" for prefix, body in enriched]
+        embeddings = embed_texts(full_texts)
         docs = []
-        for inv, emb in zip(invs, embeddings):
+        for inv, (prefix, body), emb in zip(invs, enriched, embeddings):
             await delete_by_source(session, "investigation", inv.bug_id)
+            first_service = None
+            if inv.relevant_services and isinstance(inv.relevant_services, list) and inv.relevant_services:
+                first_service = str(inv.relevant_services[0])
             docs.append({
                 "source_type": "investigation",
                 "source_id": inv.bug_id,
-                "chunk_text": _build_investigation_chunk(inv),
+                "chunk_text": body,
+                "context_prefix": prefix,
                 "chunk_metadata": {
                     "fix_type": inv.fix_type,
                     "confidence": inv.confidence,
@@ -245,35 +305,41 @@ async def reindex_all(session: AsyncSession) -> dict:
                     "created_at": inv.created_at.isoformat() if inv.created_at else None,
                 },
                 "embedding": emb,
+                "service_name": first_service,
+                "created_date": inv.created_at.date() if inv.created_at else None,
             })
         stats["investigations"] = await store_embeddings(session, docs)
 
+    # Findings
     findings_q = await session.execute(select(InvestigationFinding))
     findings = list(findings_q.scalars().all())
     logger.info("Re-indexing %d findings", len(findings))
 
     if findings:
-        chunks = [_build_finding_chunk(f) for f in findings]
-        embeddings = embed_texts(chunks)
+        enriched = [_build_finding_enriched(f) for f in findings]
+        full_texts = [f"{prefix}\n\n{body}" for prefix, body in enriched]
+        embeddings = embed_texts(full_texts)
         docs = []
-        for finding, emb in zip(findings, embeddings):
+        for finding, (prefix, body), emb in zip(findings, enriched, embeddings):
             source_id = f"{finding.bug_id}:{finding.id}"
             await delete_by_source(session, "finding", source_id)
             docs.append({
                 "source_type": "finding",
                 "source_id": source_id,
-                "chunk_text": _build_finding_chunk(finding),
+                "chunk_text": body,
+                "context_prefix": prefix,
                 "chunk_metadata": {
                     "bug_id": finding.bug_id,
                     "category": finding.category,
                     "severity": finding.severity,
                 },
                 "embedding": emb,
+                "severity": finding.severity,
+                "created_date": finding.created_at.date() if hasattr(finding, "created_at") and finding.created_at else None,
             })
         stats["findings"] = await store_embeddings(session, docs)
 
-    from sqlalchemy.orm import selectinload
-
+    # Service mappings
     mappings_q = await session.execute(
         select(ServiceTeamMapping).options(selectinload(ServiceTeamMapping.team))
     )
@@ -281,22 +347,25 @@ async def reindex_all(session: AsyncSession) -> dict:
     logger.info("Re-indexing %d service mappings", len(mappings))
 
     if mappings:
-        chunks = [_build_service_mapping_chunk(m, m.team) for m in mappings]
-        embeddings = embed_texts(chunks)
+        enriched = [_build_service_mapping_enriched(m, m.team) for m in mappings]
+        full_texts = [f"{prefix}\n\n{body}" for prefix, body in enriched]
+        embeddings = embed_texts(full_texts)
         docs = []
-        for mapping, emb in zip(mappings, embeddings):
+        for mapping, (prefix, body), emb in zip(mappings, enriched, embeddings):
             source_id = f"service:{mapping.service_name}"
             await delete_by_source(session, "service_mapping", source_id)
             docs.append({
                 "source_type": "service_mapping",
                 "source_id": source_id,
-                "chunk_text": _build_service_mapping_chunk(mapping, mapping.team),
+                "chunk_text": body,
+                "context_prefix": prefix,
                 "chunk_metadata": {
                     "service_name": mapping.service_name,
                     "tech_stack": mapping.tech_stack,
                     "github_repo": mapping.github_repo,
                 },
                 "embedding": emb,
+                "service_name": mapping.service_name,
             })
         stats["service_mappings"] = await store_embeddings(session, docs)
 
