@@ -7,14 +7,38 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bug_bot.models.models import RagDocument
 
 
+def _build_filter_clauses(
+    filters: dict | None,
+    params: dict,
+) -> list[str]:
+    """Build SQL WHERE clauses from a filter dict."""
+    clauses: list[str] = []
+    if not filters:
+        return clauses
+    if filters.get("severity"):
+        clauses.append("severity = :f_severity")
+        params["f_severity"] = filters["severity"]
+    if filters.get("status"):
+        clauses.append("status = :f_status")
+        params["f_status"] = filters["status"]
+    if filters.get("service_name"):
+        clauses.append("service_name = :f_service_name")
+        params["f_service_name"] = filters["service_name"]
+    if filters.get("source_type"):
+        clauses.append("source_type = :f_source_type")
+        params["f_source_type"] = filters["source_type"]
+    return clauses
+
+
 async def store_embeddings(
     session: AsyncSession,
     documents: list[dict],
 ) -> int:
     """Upsert document chunks with their embeddings.
 
-    Each item in `documents` must have keys:
+    Each item in ``documents`` must have keys:
       source_type, source_id, chunk_text, chunk_metadata, embedding
+    Optional keys: context_prefix, severity, status, service_name, created_date
     """
     now = datetime.now(timezone.utc)
     count = 0
@@ -24,8 +48,13 @@ async def store_embeddings(
             source_type=doc["source_type"],
             source_id=doc["source_id"],
             chunk_text=doc["chunk_text"],
+            context_prefix=doc.get("context_prefix"),
             chunk_metadata=doc.get("chunk_metadata"),
             embedding=doc["embedding"],
+            severity=doc.get("severity"),
+            status=doc.get("status"),
+            service_name=doc.get("service_name"),
+            created_date=doc.get("created_date"),
             created_at=now,
             updated_at=now,
         )
@@ -67,19 +96,25 @@ async def similarity_search(
     session: AsyncSession,
     query_embedding: list[float],
     top_k: int = 5,
+    filters: dict | None = None,
 ) -> list[dict]:
-    """Return top-k most similar documents by cosine distance."""
+    """Return top-k most similar documents by cosine distance with optional filtering."""
     vec_literal = f"'[{','.join(str(v) for v in query_embedding)}]'"
-    # Build the SQL with the vector literal inlined to avoid asyncpg's
-    # conflict between :param bind syntax and PostgreSQL's :: cast operator.
+    params: dict = {"top_k": top_k}
+    filter_clauses = _build_filter_clauses(filters, params)
+    # Always exclude rows with NULL embeddings (e.g. after a dimension migration)
+    filter_clauses.append("embedding IS NOT NULL")
+    where_sql = "WHERE " + " AND ".join(filter_clauses)
+
     stmt = text(
         f"SELECT id, source_type, source_id, chunk_text, chunk_metadata,"
         f"       1 - (embedding <=> {vec_literal}::vector) AS similarity "
         f"FROM rag_documents "
+        f"{where_sql} "
         f"ORDER BY embedding <=> {vec_literal}::vector "
         f"LIMIT :top_k"
     )
-    result = await session.execute(stmt, {"top_k": top_k})
+    result = await session.execute(stmt, params)
     rows = result.fetchall()
     return [
         {
@@ -89,6 +124,45 @@ async def similarity_search(
             "chunk_text": row[3],
             "chunk_metadata": row[4],
             "similarity": float(row[5]),
+        }
+        for row in rows
+    ]
+
+
+async def bm25_search(
+    session: AsyncSession,
+    query: str,
+    top_k: int = 20,
+    filters: dict | None = None,
+) -> list[dict]:
+    """Full-text search using PostgreSQL tsvector/tsquery."""
+    params: dict = {"query": query, "top_k": top_k}
+    filter_clauses = _build_filter_clauses(filters, params)
+    # The tsvector match is always required; also skip rows with NULL search_vector
+    all_clauses = [
+        "search_vector IS NOT NULL",
+        "search_vector @@ plainto_tsquery('english', :query)",
+    ] + filter_clauses
+    where_sql = " AND ".join(all_clauses)
+
+    stmt = text(
+        f"SELECT id, source_type, source_id, chunk_text, chunk_metadata, "
+        f"       ts_rank(search_vector, plainto_tsquery('english', :query)) AS rank "
+        f"FROM rag_documents "
+        f"WHERE {where_sql} "
+        f"ORDER BY rank DESC "
+        f"LIMIT :top_k"
+    )
+    result = await session.execute(stmt, params)
+    rows = result.fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "source_type": row[1],
+            "source_id": row[2],
+            "chunk_text": row[3],
+            "chunk_metadata": row[4],
+            "bm25_rank": float(row[5]),
         }
         for row in rows
     ]

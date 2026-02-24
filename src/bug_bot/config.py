@@ -66,8 +66,15 @@ class Settings(BaseSettings):
     mysql_readonly_url: str = ""
 
     # RAG
-    rag_embedding_model: str = "all-MiniLM-L6-v2"
+    rag_embedding_model: str = "BAAI/bge-base-en-v1.5"
+    rag_embedding_dim: int = 768
     rag_top_k: int = 5
+    rag_retrieval_k: int = 20  # over-fetch for reranking
+    rag_rerank_top_k: int = 5  # final results after reranking
+    rag_rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    rag_cache_ttl_seconds: int = 300  # 5 minute TTL for query cache
+    rag_bm25_weight: float = 0.3
+    rag_semantic_weight: float = 0.7
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

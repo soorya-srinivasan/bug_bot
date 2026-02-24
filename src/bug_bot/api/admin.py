@@ -2063,6 +2063,7 @@ class ChatMessageItem(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     conversation_history: list[ChatMessageItem] = []
+    filters: dict | None = None
 
 
 class ChatSourceItem(BaseModel):
@@ -2098,7 +2099,7 @@ async def chat(payload: ChatRequest):
     async with async_session() as session:
         try:
             history = [{"role": m.role, "content": m.content} for m in payload.conversation_history]
-            result = await rag_chat(session, payload.message, history)
+            result = await rag_chat(session, payload.message, history, filters=payload.filters)
         except Exception as e:
             logger.exception("RAG chat error")
             raise HTTPException(
@@ -2108,6 +2109,38 @@ async def chat(payload: ChatRequest):
     return ChatResponse(
         answer=result["answer"],
         sources=[ChatSourceItem(**s) for s in result["sources"]],
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(payload: ChatRequest):
+    """Streaming RAG chat endpoint — returns Server-Sent Events.
+
+    Event protocol:
+      event: sources  — retrieved sources (sent first)
+      event: token    — each token chunk of the answer
+      event: done     — completion signal
+      event: error    — on error
+    """
+    from fastapi.responses import StreamingResponse
+    from bug_bot.rag.chat import rag_chat_stream
+
+    async def event_generator():
+        async with async_session() as session:
+            history = [{"role": m.role, "content": m.content} for m in payload.conversation_history]
+            async for event in rag_chat_stream(
+                session, payload.message, history, filters=payload.filters,
+            ):
+                yield event
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

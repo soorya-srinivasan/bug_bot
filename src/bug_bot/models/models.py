@@ -3,7 +3,7 @@ from datetime import datetime, date, time
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import String, Text, Float, Integer, Boolean, DateTime, Date, Time, ForeignKey, Index, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import UUID, JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -386,8 +386,15 @@ class RagDocument(Base):
     source_type: Mapped[str] = mapped_column(String(30), nullable=False)
     source_id: Mapped[str] = mapped_column(String(100), nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
+    context_prefix: Mapped[str | None] = mapped_column(Text, nullable=True)
     chunk_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    embedding = mapped_column(Vector(384), nullable=False)
+    embedding = mapped_column(Vector(768), nullable=True)
+    search_vector = mapped_column(TSVECTOR, nullable=True)
+    # Denormalized metadata for fast filtering
+    severity: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    service_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -395,4 +402,8 @@ class RagDocument(Base):
 
     __table_args__ = (
         Index("idx_rag_documents_source", "source_type", "source_id"),
+        Index("idx_rag_documents_severity", "severity"),
+        Index("idx_rag_documents_status", "status"),
+        Index("idx_rag_documents_service", "service_name"),
+        Index("idx_rag_documents_created_date", "created_date"),
     )
