@@ -4,6 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from claude_agent_sdk import (
+    AgentDefinition,
     ClaudeSDKClient,
     ClaudeAgentOptions,
     AssistantMessage,
@@ -44,6 +45,19 @@ _OUTPUT_SCHEMA = {
                 "enum": ["code_fix", "data_fix", "config_fix", "needs_human", "unknown"],
             },
             "pr_url": {"type": ["string", "null"]},
+            "pr_urls": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "branch": {"type": "string"},
+                        "pr_url": {"type": "string"},
+                        "service": {"type": "string"},
+                    },
+                    "required": ["pr_url"],
+                },
+            },
             "summary": {"type": "string"},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "recommended_actions": {"type": "array", "items": {"type": "string"}},
@@ -76,6 +90,24 @@ _OUTPUT_SCHEMA = {
     },
 }
 
+_CODE_REVIEWER_PROMPT = (
+    "You are a code-review assistant. You receive proposed code changes and review them "
+    "before they are committed and pushed as a PR.\n\n"
+    "Review criteria:\n"
+    "1. **Correctness** — Does the fix address the stated root cause? Are edge cases handled? "
+    "Could the change introduce new bugs?\n"
+    "2. **Security** — No hardcoded secrets, no injection vulnerabilities, proper input validation.\n"
+    "3. **Minimal change** — Only the lines necessary to fix the bug should be changed. "
+    "No refactoring, no formatting changes, no unrelated improvements.\n"
+    "4. **No regressions** — Existing error handling is preserved, API contracts remain intact, "
+    "no behavioral changes beyond the fix.\n\n"
+    "Output your review as:\n"
+    "- APPROVED — if the changes pass all criteria\n"
+    "- CHANGES REQUESTED — with a numbered list of specific issues to fix\n\n"
+    "Be concise. Focus only on the diff, not the surrounding code."
+)
+
+
 def _build_system_prompt() -> str:
     org = settings.github_org or "your-github-org"
     workspace = "/tmp/bugbot-workspace/<bug_id>"
@@ -86,27 +118,63 @@ def _build_system_prompt() -> str:
         "and create fixes when possible.\n\n"
         "For .NET services (OXO.APIs): check Grafana dashboards, look for common C#/.NET issues.\n"
         "For Ruby/Rails services (vconnect): check New Relic APM, look for Rails-specific issues.\n\n"
-        "If the report seems vague, do not waste time guessing at architecture or root causes or looking for git repositories. "
-        "Ask the reporter for more details first."
-        "Then try to get more information by using tools that can retrieve conversations and context. "
-        "If you are still unable to get the required information, ask the reporter for more details "
-        "by setting the clarification_questions field to a list of concise, specific questions. "
-        "Each element must be a single question string. Ask only about symptoms, reproduction "
-        "steps, and relevant details — not about architecture or possible root causes.\n\n"
+        "VAGUENESS GATE (MUST CHECK BEFORE ANY TOOL CALL):\n"
+        "Before querying Loki, GitHub, or any other tool, evaluate whether the bug report "
+        "contains enough detail to investigate. A report is TOO VAGUE if it lacks ALL of:\n"
+        "  - A specific error message, HTTP status code, or stack trace\n"
+        "  - Steps to reproduce or a description of what the user was doing\n"
+        "  - An affected user identifier (phone number, email, user ID, account name, CR number)\n"
+        "  - A time window narrower than 'sometime recently'\n"
+        "Examples of vague reports: 'I can't onboard', 'portal is not working', 'getting an error', "
+        "'payment failed'. These do NOT have enough detail to investigate.\n"
+        "If the report is too vague:\n"
+        "  1. Do NOT call any tools — no Loki queries, no GitHub searches, no service lookups.\n"
+        "  2. Set `clarification_questions` to a list of specific, practical questions. Ask for:\n"
+        "     - What exactly they were trying to do (step by step)\n"
+        "     - What they saw (error message, blank screen, wrong data, etc.)\n"
+        "     - Their identifier (phone number, email, CR number, account name — whichever is relevant)\n"
+        "     - When it happened (approximate time)\n"
+        "     - Screenshots if possible\n"
+        "  3. Set `fix_type='unknown'`, `action='ask_reporter'`, `confidence=0.0`\n"
+        "  4. STOP immediately. Do not proceed to investigation steps.\n"
+        "Only proceed to Loki/GitHub investigation if the report has at least a specific symptom "
+        "AND either an affected identifier or reproduction steps.\n\n"
         f"GitHub organisation: {org}. All repos are under this org.\n\n"
         "IMPORTANT: When creating code fixes, use ONLY GitHub MCP tools — no Bash, no local git:\n"
         "  1. Read the file:    mcp__github__get_file_contents(owner, repo, path, ref='main')\n"
         "  2. Create branch:    mcp__github__create_branch(owner, repo, branch, from_branch='main')\n"
-        "  3. Apply fix:        edit the file content in-context\n"
-        "  4. Commit changes:   mcp__github__push_files(owner, repo, branch, files=[{path, content}], message)\n"
+        "  3. Prepare fix:      edit the file content in-context, prepare the new file content\n"
+        "  4. CODE REVIEW (MANDATORY — DO NOT SKIP):\n"
+        "     You MUST use the Task tool to spawn the 'code-reviewer' subagent BEFORE committing.\n"
+        "     Pass it the repo name, file path(s), the original code, and your proposed changes.\n"
+        "     Example Task call:\n"
+        "       Task(subagent_type='code-reviewer', prompt='Review this fix for <repo>:\\n\\n"
+        "       File: <path>\\nOriginal:\\n```\\n<old code>\\n```\\nProposed:\\n```\\n<new code>\\n```')\n"
+        "     - If the reviewer says APPROVED → proceed to step 5\n"
+        "     - If the reviewer says CHANGES REQUESTED → apply the requested changes, then re-submit for review\n"
+        "     - NEVER call mcp__github__push_files or mcp__github__create_or_update_file without an APPROVED review\n"
+        "  5. Commit changes:   mcp__github__push_files(owner, repo, branch, files=[{path, content}], message)\n"
         "     OR single file:   mcp__github__create_or_update_file(owner, repo, path, message, content, branch, sha)\n"
         "     (content must be base64-encoded; sha is the blob SHA returned by get_file_contents)\n"
-        "  5. Create PR:        mcp__github__create_pull_request(owner, repo, title, body, head, base='main')\n"
+        "  6. Create PR:        mcp__github__create_pull_request(owner, repo, title, body, head, base='main')\n"
         f"  owner is always '{org}'\n"
         "- Branch naming: bugfix/<bug_id>-<short-desc>\n"
         "- Commit message: fix(<service>): <desc> [<bug_id>]\n"
         "- Keep changes minimal — only fix the reported issue\n"
         "- Never push to main/master directly\n\n"
+        "MULTI-SERVICE FIX REQUIREMENT (CRITICAL):\n"
+        "When you find issues in multiple services (e.g. backend sends wrong field name AND frontend sends wrong data type), "
+        "you MUST address ALL of them — not just the first one you find. For each affected service:\n"
+        "  - If you can fix it: create a separate PR in that service's repo (each one must go through code review)\n"
+        "  - If you cannot fix it (e.g. unfamiliar stack, complex refactor): explicitly describe the issue, "
+        "the affected file/line, and what needs to change in the `summary` and `recommended_actions` fields\n"
+        "Do NOT silently skip issues you discovered. Every issue found during investigation must appear in the output.\n\n"
+        "MULTI-REPO PR WORKFLOW:\n"
+        "If a bug spans multiple services in different repos, create a separate PR for each repo.\n"
+        "- Each PR must be reviewed by the code-reviewer subagent before committing\n"
+        "- Populate `pr_urls` as a list of `{repo, branch, pr_url, service}` objects\n"
+        "- Set `pr_url` to the first/primary PR URL for backward compatibility\n"
+        "- Each PR should follow the same branch naming, commit message, and PR body conventions\n\n"
         "GUARDRAIL — Data Source Restriction:\n"
         "You may ONLY read data from these three sources:\n"
         "  1. Grafana / Loki — via mcp__bugbot_tools__query_loki_logs and mcp__bugbot_tools__list_datasources\n"
@@ -162,7 +230,7 @@ def _build_options(resume: str | None = None, cwd: str = "/tmp/bugbot-workspace"
     return ClaudeAgentOptions(
         model="claude-sonnet-4-5-20250929",
         permission_mode="bypassPermissions",
-        max_turns=50,
+        max_turns=100,
         cwd=cwd,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
@@ -170,6 +238,14 @@ def _build_options(resume: str | None = None, cwd: str = "/tmp/bugbot-workspace"
         system_prompt=_SYSTEM_PROMPT,
         output_format=_OUTPUT_SCHEMA,
         resume=resume,
+        agents={
+            "code-reviewer": AgentDefinition(
+                description="Reviews proposed code changes for correctness, security, and minimal change principle. Invoke before creating any PR.",
+                prompt=_CODE_REVIEWER_PROMPT,
+                tools=["Read", "Grep", "Glob", "mcp__github__*"],
+                model="sonnet",
+            ),
+        },
         sandbox={
             "enabled": True,
             # All git operations go through GitHub MCP (API-based), so Bash git

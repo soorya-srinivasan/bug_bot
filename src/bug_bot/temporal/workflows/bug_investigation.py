@@ -259,11 +259,14 @@ class BugInvestigationWorkflow:
                            "confidence": investigation_dict.get("confidence")}],
                     start_to_close_timeout=timedelta(seconds=10),
                 )
-                if investigation_dict.get("pr_url"):
+                pr_urls = investigation_dict.get("pr_urls") or []
+                if not pr_urls and investigation_dict.get("pr_url"):
+                    pr_urls = [{"pr_url": investigation_dict["pr_url"]}]
+                for pr_entry in pr_urls:
                     await workflow.execute_activity(
                         log_conversation_event,
                         args=[input.bug_id, "pr_created", "bot", "bugbot", None,
-                              investigation_dict.get("pr_url"), None],
+                              pr_entry.get("pr_url"), None],
                         start_to_close_timeout=timedelta(seconds=10),
                     )
                 results_input = PostResultsInput(
