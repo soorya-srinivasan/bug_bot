@@ -20,9 +20,7 @@ from bug_bot.service_matcher import _fetch_all_services, match_services
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_TODAY = datetime.date.today().isoformat()
-
-_EXTRACT_PROMPT = f"""\
+_EXTRACT_PROMPT_TEMPLATE = """\
 Extract structured information from the following log query request.
 
 Respond ONLY with a valid JSON object — no markdown, no explanation, no code fences.
@@ -35,7 +33,9 @@ Fields to extract:
 - end_time: ISO8601 string or null (resolve relative times to absolute UTC)
 - keywords: array of strings (other filter terms like "error", "timeout"; always include severity words like "error"/"warn")
 
-Today is {_TODAY} (UTC). Resolve "yesterday", "last 2 hours", etc. to absolute ISO8601 UTC timestamps.
+The current UTC date and time is {now_utc}. Use this exact moment as "now" when resolving \
+relative expressions like "last 2 hours", "yesterday", "last 30 minutes", etc. \
+Do NOT use midnight or any other assumed time — use {now_utc} as the anchor.
 
 Query: """
 
@@ -44,7 +44,9 @@ async def _extract_log_intent(query: str) -> dict:
     """Call Claude Haiku to extract structured intent from a natural language log query."""
     logger.info("[logs] Extracting intent from query: %r", query)
     client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-    prompt = _EXTRACT_PROMPT + query
+    # Compute current UTC time per-request so the anchor is always accurate.
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    prompt = _EXTRACT_PROMPT_TEMPLATE.format(now_utc=now_utc) + query
 
     message = await client.messages.create(
         model="claude-haiku-4-5-20251001",
