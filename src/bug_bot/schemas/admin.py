@@ -80,11 +80,19 @@ class InvestigationMessageResponse(BaseModel):
     created_at: datetime
 
 
+class PRUrlEntry(BaseModel):
+    repo: str = ""
+    branch: str = ""
+    pr_url: str
+    service: str = ""
+
+
 class InvestigationResponse(BaseModel):
     bug_id: str
     root_cause: str | None = None
     fix_type: str
     pr_url: str | None = None
+    pr_urls: list[PRUrlEntry] = []
     summary: str
     confidence: float
     relevant_services: list[str] = []
@@ -107,6 +115,7 @@ class InvestigationFollowupResponse(BaseModel):
     confidence: float
     root_cause: str | None = None
     pr_url: str | None = None
+    pr_urls: list[PRUrlEntry] = []
     recommended_actions: list[str] = []
     relevant_services: list[str] = []
     cost_usd: float | None = None

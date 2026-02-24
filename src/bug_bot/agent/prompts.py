@@ -84,6 +84,27 @@ Follow these steps in order:
 > Do NOT use Read, Glob, Grep, or Bash to access system files during investigation.
 > The local workspace is reserved exclusively for writing and committing code fixes.
 
+0. **VAGUENESS CHECK (MANDATORY — BEFORE ANY TOOL CALL)**
+   Read the bug report above carefully. Does it contain:
+   - A specific symptom (error message, HTTP code, stack trace, wrong behavior)?
+   - An affected user/entity identifier (phone number, email, user ID, CR number, account)?
+   - Steps to reproduce OR a clear description of what they were doing?
+
+   If the report is just a vague statement like "can't onboard", "portal not working",
+   "getting error", "payment failed" without specifics — **STOP HERE**.
+   Do NOT call any tools. Instead:
+   - Set `clarification_questions` to ask the reporter for:
+     - What exactly they were doing step by step
+     - What they saw (exact error message, blank page, wrong data, etc.)
+     - Their identifier (phone number, email, CR number — whichever applies to the feature)
+     - When it happened (date/time)
+     - A screenshot if possible
+   - Set `fix_type="unknown"`, `action="ask_reporter"`, `confidence=0.0`
+   - Return immediately. Do NOT proceed to step 1.
+
+   Only continue to step 1 if the report has at least a specific symptom AND
+   either a user identifier or clear reproduction steps.
+
 1. **Observability — Grafana Loki (MANDATORY FIRST STEP)** *(skill: logs_reading.md)*
    Grafana is running at http://localhost:3000 and Loki at http://localhost:3100.
    You MUST query Loki before doing anything else.
@@ -93,20 +114,31 @@ Follow these steps in order:
         "Grafana Loki is unreachable (http://localhost:3000). Cannot fetch logs — manual investigation required."
         Set `fix_type="needs_human"`, `action="escalate"`, `confidence=0.0` and STOP. Do not proceed further.
 
-   b. Query logs using `mcp__bugbot_tools__query_loki_logs` with a LogQL expression.
-      Try these queries in order until you get results (substitute service name where shown):
+   b. **User/entity identifier search (do this FIRST if an identifier is available):**
+      If the bug report contains a user identifier (phone number, email, user ID, CR number,
+      account name, order ID, etc.), query for ALL logs containing that identifier — not just
+      errors. This shows the full request flow and reveals what actually happened:
+        - `{{app="{services_str}"}} |= "<identifier>"`
+        - `{{service="{services_str}"}} |= "<identifier>"`
+        - `{{app=~".+"}} |= "<identifier>"` (search across all services if needed)
+      This will show the request path, parameters received, decisions made, and any rejections
+      or failures — even if they weren't logged as errors.
+
+   c. **Error log search (do this in addition to or instead of identifier search):**
+      Query for error logs using these patterns in order until you get results:
         - `{{app="{services_str}"}} |= "error"`
         - `{{app="{services_str}"}} |~ "(?i)error|exception|traceback"`
+        - `{{service="{services_str}"}} |~ "(?i)error|exception|traceback"`
         - `{{service_name="{services_str}"}} |= "error"`
         - `{{job="{services_str}"}} |~ "(?i)error|exception|traceback"`
         - `{{}} |= "{services_str}" |~ "(?i)error|exception"` (broad fallback)
       Start with start_offset_minutes=60. If no logs are found, retry with start_offset_minutes=360.
 
-   c. If the query tool call itself succeeds but returns no log lines, record that explicitly:
-      "No error logs found in Grafana Loki for service {services_str} in the last 6 hours."
+   d. If the query tool call itself succeeds but returns no log lines, record that explicitly:
+      "No logs found in Grafana Loki for service {services_str} in the last 6 hours."
       Continue to step 2 with this note in your summary.
 
-   d. If logs ARE found:
+   e. If logs ARE found:
       - Record the error type, message, frequency, and first/last occurrence using `mcp__bugbot_tools__report_finding`.
       - Note the exact log labels returned so you can use them in subsequent queries.
       - Construct a Grafana Explore deep-link:
@@ -141,25 +173,61 @@ Follow these steps in order:
 6. **Action — choose based on root cause:** *(skill: pr_execution.md if code fix)*
 
    **IF root cause is a CODE BUG and confidence > 0.8:**
-   - Use `mcp__git__create_branch` to create a branch: `<bug_id>-<short-desc>`
-   - Make the minimal fix (add a guard clause only — do not refactor surrounding code)
-   - Use `mcp__git__commit` with message: `fix(<service>): <description> [<bug_id>]`
-   - Use `mcp__git__push` to push the branch
-   - Use `mcp__github__create_pull_request` to open the PR (do NOT use Bash or gh CLI for this):
-     - repo: `<org>/<repo>`
-     - title: `fix: <description> [<bug_id>]`
-     - head: `<branch-name>`
-     - base: `main` (or `master` — check what the repo default branch is)
-     - body must include a "Culprit Commit" section:
-       ```
-       ## Culprit Commit
-       Introduced by **<author name>** (<author email>)
-       Commit: `<short hash>` — <commit message>
-       Date: <commit date>
-       ```
-   - Set `fix_type="code_fix"`, `pr_url=<pr_url>`
+
+   For EACH affected service (you MUST fix ALL services where you found issues):
+
+   **Step A — Prepare the fix:**
+   - Read the file: `mcp__github__get_file_contents(owner, repo, path, ref='main')`
+   - Create branch: `mcp__github__create_branch(owner, repo, branch='bugfix/<bug_id>-<short-desc>', from_branch='main')`
+   - Prepare the corrected file content in-context
+
+   **Step B — Code review (MANDATORY — DO NOT SKIP):**
+   You MUST use the Task tool to spawn the `code-reviewer` subagent and pass it the diff.
+   Example:
+   ```
+   Task(subagent_type="code-reviewer", prompt="Review this fix for <repo>:
+   File: <path>
+   Original:
+   ```
+   <original code snippet>
+   ```
+   Proposed:
+   ```
+   <your fixed code snippet>
+   ```
+   Root cause: <what the bug was>")
+   ```
+   - If reviewer says **APPROVED** → proceed to Step C
+   - If reviewer says **CHANGES REQUESTED** → apply changes, re-submit to code-reviewer
+   - **NEVER call mcp__github__push_files or mcp__github__create_or_update_file without APPROVED review**
+
+   **Step C — Commit and push (only after APPROVED review):**
+   - `mcp__github__push_files(owner, repo, branch, files=[{{path, content}}], message)`
+     OR `mcp__github__create_or_update_file(owner, repo, path, message, content, branch, sha)`
+
+   **Step D — Create the PR:**
+   - `mcp__github__create_pull_request(owner, repo, title='fix: <desc> [{bug_id}]', body, head, base='main')`
+   - PR body must include a "Culprit Commit" section:
+     ```
+     ## Culprit Commit
+     Introduced by **<author name>** (<author email>)
+     Commit: `<short hash>` — <commit message>
+     Date: <commit date>
+     ```
+
+   **Repeat Steps A–D for every affected service/repo.** Do not stop after the first fix.
+
+   If you cannot fix a particular service (unfamiliar stack, too complex), you MUST:
+     - Describe the exact issue, affected file path, and line number in `summary`
+     - Add a specific recommended action like "Fix <file> in <repo>: <what needs to change>"
+
+   After all fixes:
+   - Set `pr_urls` to a list of `{{"repo": "<repo>", "branch": "<branch>", "pr_url": "<url>", "service": "<service>"}}`
+   - Set `pr_url` to the first/primary PR URL (backward compat)
+   - Set `fix_type="code_fix"`
    - Set `culprit_commit` to `{{"hash": "<short_hash>", "author": "<name>", "email": "<email>", "date": "<date>", "message": "<commit message>"}}`
-   - In `summary`, include: `"Root cause: <cause>. PR created: <pr_url>"`
+   - In `summary`, include ALL issues found across all services, even if you only fixed some.
+     Format: `"Root cause: <cause>. PRs created: <pr_urls>. Additional issue: <description>"`
 
    **ELSE IF root cause is a DATA ISSUE (bad/missing/corrupt data in DB):**
    - Use `mcp__postgres__*` or `mcp__mysql__*` to run the specific READ-ONLY query

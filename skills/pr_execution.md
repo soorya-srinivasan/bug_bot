@@ -116,6 +116,24 @@ mcp__github__create_pull_request(
 
 ---
 
+## Multi-Repo PR Workflow
+
+When a bug spans multiple services in different repositories, create a separate PR for each affected repo:
+
+1. **Identify all affected repos** — from your investigation, list every repo that needs a fix.
+2. **For each repo**, repeat Steps 1–4 above:
+   - Read the file(s) to change
+   - Create a branch (`bugfix/<bug-id>-<short-description>`)
+   - Commit the fix
+   - Create the PR
+3. **Invoke the code-reviewer subagent** for each set of changes before committing.
+4. **Populate output fields:**
+   - Set `pr_urls` to a list of objects: `[{"repo": "<repo>", "branch": "<branch>", "pr_url": "<url>", "service": "<service>"}, ...]`
+   - Set `pr_url` to the first/primary PR URL (backward compatibility)
+5. **Cross-reference PRs** — in each PR body, link to the other related PRs under a "Related PRs" section.
+
+---
+
 ## Step 5 — Post-PR
 
 - Add the owning team as reviewers (from `service_team_fetching.md`)

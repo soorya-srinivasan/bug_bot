@@ -62,13 +62,30 @@ def format_investigation_result(result: dict, bug_id: str) -> list[dict]:
             }
         )
 
-    if result.get("pr_url"):
+    pr_urls = result.get("pr_urls") or []
+    if not pr_urls and result.get("pr_url"):
+        pr_urls = [{"pr_url": result["pr_url"]}]
+    if len(pr_urls) == 1:
         blocks.append(
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f":pr: *Pull Request:* <{result['pr_url']}|View PR>",
+                    "text": f":pr: *Pull Request:* <{pr_urls[0]['pr_url']}|View PR>",
+                },
+            }
+        )
+    elif len(pr_urls) > 1:
+        pr_lines = "\n".join(
+            f"  {i}. {e.get('service') or e.get('repo', 'PR')}: <{e['pr_url']}|View PR>"
+            for i, e in enumerate(pr_urls, 1)
+        )
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f":pr: *Pull Requests:*\n{pr_lines}",
                 },
             }
         )
@@ -107,8 +124,12 @@ def format_summary_message(
     if result.get("grafana_logs_url"):
         text += f"\n:mag: <{result['grafana_logs_url']}|View logs in Grafana Loki>"
 
-    if result.get("pr_url"):
-        text += f"\n:pr: <{result['pr_url']}|View PR>"
+    pr_urls = result.get("pr_urls") or []
+    if not pr_urls and result.get("pr_url"):
+        pr_urls = [{"pr_url": result["pr_url"]}]
+    for e in pr_urls:
+        label = e.get("service") or e.get("repo") or "PR"
+        text += f"\n:pr: <{e['pr_url']}|{label}>"
 
     return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
 
@@ -157,8 +178,17 @@ def format_investigation_as_markdown(result: dict, bug_id: str) -> str:
             f"**Date:** {cc.get('date', 'unknown')}",
             "",
         ]
-    if result.get("pr_url"):
-        lines += ["## Pull Request", "", f"[View PR]({result['pr_url']})", ""]
+    md_pr_urls = result.get("pr_urls") or []
+    if not md_pr_urls and result.get("pr_url"):
+        md_pr_urls = [{"pr_url": result["pr_url"]}]
+    if len(md_pr_urls) == 1:
+        lines += ["## Pull Request", "", f"[View PR]({md_pr_urls[0]['pr_url']})", ""]
+    elif len(md_pr_urls) > 1:
+        lines += ["## Pull Requests", ""]
+        for e in md_pr_urls:
+            label = e.get("service") or e.get("repo") or "PR"
+            lines.append(f"- {label}: [View PR]({e['pr_url']})")
+        lines.append("")
     if result.get("recommended_actions"):
         lines += ["## Recommended Actions", ""]
         for action in result["recommended_actions"]:

@@ -200,6 +200,17 @@ class BugRepository:
         result = await self.session.execute(stmt)
         return int(result.scalar_one()) > 0
 
+    @staticmethod
+    def _normalize_pr_urls(result: dict) -> list:
+        """Extract pr_urls from result, falling back to wrapping pr_url."""
+        pr_urls = result.get("pr_urls")
+        if pr_urls:
+            return pr_urls
+        pr_url = result.get("pr_url")
+        if pr_url:
+            return [{"pr_url": pr_url}]
+        return []
+
     async def save_investigation(self, bug_id: str, result: dict) -> Investigation:
         conversation_history = result.get("conversation_history")
         investigation = Investigation(
@@ -207,6 +218,7 @@ class BugRepository:
             root_cause=result.get("root_cause"),
             fix_type=result["fix_type"],
             pr_url=result.get("pr_url"),
+            pr_urls=self._normalize_pr_urls(result),
             summary=result["summary"],
             confidence=result.get("confidence", 0.0),
             relevant_services=result.get("relevant_services", []),
@@ -679,6 +691,7 @@ class BugRepository:
             confidence=result.get("confidence", 0.0),
             root_cause=result.get("root_cause"),
             pr_url=result.get("pr_url"),
+            pr_urls=self._normalize_pr_urls(result),
             recommended_actions=result.get("recommended_actions", []),
             relevant_services=result.get("relevant_services", []),
             cost_usd=result.get("cost_usd"),
