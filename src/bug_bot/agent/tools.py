@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re as _re
 from typing import Any, Optional
 
 import httpx
@@ -11,22 +12,77 @@ try:
 except ImportError:
     psycopg = None  # type: ignore
 
+try:
+    import pymysql
+    import pymysql.cursors
+except ImportError:
+    pymysql = None  # type: ignore
+
 from claude_agent_sdk import tool, create_sdk_mcp_server
 
 from bug_bot.config import settings
 
 
-def _postgres_conninfo() -> Optional[str]:
-    """Return psycopg-compatible connection string for the read-only external DB."""
+def _postgres_conninfo(database_name: Optional[str] = None) -> Optional[str]:
+    """Return psycopg-compatible connection string for the read-only external DB.
+
+    If database_name is provided, overrides the database component of the URL so
+    the agent can connect to the specific service database returned by lookup_service_owner.
+    """
     url = (settings.postgres_readonly_url or "").strip()
     if not url:
         return None
-    return url.replace("postgresql+asyncpg", "postgresql", 1)
+    conninfo = url.replace("postgresql+asyncpg", "postgresql", 1)
+    if database_name:
+        # Replace the database name: postgresql://user:pass@host:port/DBNAME
+        base, _, _ = conninfo.partition("?")
+        parts = base.rsplit("/", 1)
+        if len(parts) == 2:
+            conninfo = parts[0] + "/" + database_name
+    return conninfo
 
 
 def _bugbot_conninfo() -> str:
     """Return psycopg-compatible connection string for the main Bug Bot database."""
     return settings.database_url.replace("postgresql+asyncpg", "postgresql", 1)
+
+
+def _mysql_conninfo(database_name: Optional[str] = None) -> Optional[dict]:
+    """Parse MYSQL_READONLY_URL into a kwargs dict for pymysql.connect().
+
+    Accepts 'mysql://user:pass@host:port/dbname' or 'mysql+pymysql://...' format.
+    If database_name is provided, overrides the database in the URL so the agent
+    can connect to the specific service database returned by lookup_service_owner.
+    Returns None if not configured.
+    """
+    raw = (settings.mysql_readonly_url or "").strip()
+    if not raw:
+        return None
+    for prefix in ("mysql+pymysql://", "mysql://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    try:
+        userinfo, hostpart = raw.split("@", 1)
+        user, password = userinfo.split(":", 1)
+        if "/" in hostpart:
+            hostport, dbname = hostpart.split("/", 1)
+        else:
+            hostport, dbname = hostpart, ""
+        if ":" in hostport:
+            host, port_str = hostport.split(":", 1)
+            port = int(port_str)
+        else:
+            host, port = hostport, 3306
+    except (ValueError, IndexError):
+        return None
+    return {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database_name or dbname,
+    }
 
 
 def _text_result(text: str) -> dict[str, Any]:
@@ -83,10 +139,10 @@ def _postgres_describe_table_sync(table: str, schema: str) -> str:
         return f"Error: {e}"
 
 
-def _postgres_run_query_sync(query: str) -> str:
+def _postgres_run_query_sync(query: str, database_name: Optional[str] = None) -> str:
     if psycopg is None:
         return "Error: psycopg not installed."
-    conninfo = _postgres_conninfo()
+    conninfo = _postgres_conninfo(database_name)
     if not conninfo:
         return "Error: postgres_readonly_url is not configured."
     try:
@@ -178,6 +234,134 @@ def _postgres_inspect_query_sync(query: str) -> str:
         return f"Error: {e}"
 
 
+def _mysql_show_tables_sync(database_name: Optional[str] = None) -> str:
+    if pymysql is None:
+        return "Error: pymysql not installed."
+    cfg = _mysql_conninfo(database_name)
+    if not cfg:
+        return "Error: mysql_readonly_url is not configured."
+    try:
+        with pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SHOW TABLES;")
+                rows = cur.fetchall()
+                if not rows:
+                    db = database_name or cfg.get("database", "configured database")
+                    return f"No tables found in '{db}'."
+                return "\n".join(next(iter(r.values())) for r in rows)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _mysql_describe_table_sync(table: str, database_name: Optional[str] = None) -> str:
+    if pymysql is None:
+        return "Error: pymysql not installed."
+    cfg = _mysql_conninfo(database_name)
+    if not cfg:
+        return "Error: mysql_readonly_url is not configured."
+    try:
+        with pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COLUMN_NAME AS column_name,
+                           DATA_TYPE   AS data_type,
+                           IS_NULLABLE AS is_nullable
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION;
+                    """,
+                    (table,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return f"Table '{table}' not found."
+                lines = [
+                    f"{r['column_name']}\t{r['data_type']}\t{r['is_nullable']}" for r in rows
+                ]
+                return "column_name\tdata_type\tis_nullable\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _mysql_run_query_sync(query: str, database_name: Optional[str] = None) -> str:
+    if pymysql is None:
+        return "Error: pymysql not installed."
+    cfg = _mysql_conninfo(database_name)
+    if not cfg:
+        return "Error: mysql_readonly_url is not configured."
+    try:
+        with pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+                if not rows:
+                    return "Query returned no results."
+                columns = list(rows[0].keys())
+                header = ",".join(columns)
+                data_rows = [",".join(str(r[c]) for c in columns) for r in rows]
+                return f"{header}\n" + "\n".join(data_rows)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def _mysql_summarize_table_sync(table: str, database_name: Optional[str] = None) -> str:
+    if pymysql is None:
+        return "Error: pymysql not installed."
+    cfg = _mysql_conninfo(database_name)
+    if not cfg:
+        return "Error: mysql_readonly_url is not configured."
+    numeric_types = {"int", "integer", "bigint", "smallint", "tinyint",
+                     "float", "double", "decimal", "numeric"}
+    text_types = {"char", "varchar", "text", "tinytext", "mediumtext", "longtext", "enum", "set"}
+    try:
+        with pymysql.connect(**cfg, cursorclass=pymysql.cursors.DictCursor, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COLUMN_NAME AS column_name,
+                           DATA_TYPE   AS data_type
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = %s
+                    ORDER BY ORDINAL_POSITION;
+                    """,
+                    (table,),
+                )
+                columns = cur.fetchall()
+                if not columns:
+                    return f"Table '{table}' not found."
+                parts = [f"Summary for table: {table}\n"]
+                for col in columns:
+                    cname = col["column_name"]
+                    dtype = col["data_type"].lower()
+                    if any(t in dtype for t in numeric_types):
+                        cur.execute(
+                            f"SELECT COUNT(*) AS total_rows, COUNT(`{cname}`) AS non_null_rows, "
+                            f"MIN(`{cname}`) AS min, MAX(`{cname}`) AS max, "
+                            f"AVG(`{cname}`) AS average FROM `{table}`;"
+                        )
+                    elif any(t in dtype for t in text_types):
+                        cur.execute(
+                            f"SELECT COUNT(*) AS total_rows, COUNT(`{cname}`) AS non_null_rows, "
+                            f"COUNT(DISTINCT `{cname}`) AS unique_values FROM `{table}`;"
+                        )
+                    else:
+                        cur.execute(
+                            f"SELECT COUNT(*) AS total_rows, COUNT(`{cname}`) AS non_null_rows "
+                            f"FROM `{table}`;"
+                        )
+                    row = cur.fetchone()
+                    parts.append(f"\n--- {cname} ({dtype}) ---")
+                    if row:
+                        for k, v in row.items():
+                            parts.append(f"  {k}: {v}")
+                return "\n".join(parts)
+    except Exception as e:
+        return f"Error: {e}"
+
+
 def _lookup_service_owner_sync(service_name: str) -> str:
     """Synchronous psycopg query — avoids event-loop conflicts in the MCP server."""
     if psycopg is None:
@@ -190,6 +374,7 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                     SELECT
                         s.service_name, s.github_repo, s.tech_stack, s.description,
                         s.team_slack_group, s.service_owner, s.primary_oncall,
+                        s.database_name, s.dialect,
                         t.slack_group_id, t.oncall_engineer AS team_oncall
                     FROM service_team_mapping s
                     LEFT JOIN teams t ON s.team_id = t.id
@@ -202,11 +387,16 @@ def _lookup_service_owner_sync(service_name: str) -> str:
                 if not row:
                     return f"No mapping found for service: {service_name}"
                 desc_line = f"Description: {row['description']}\n" if row.get("description") else ""
+                db_line = (
+                    f"Database: {row['database_name']} (dialect: {row['dialect']})\n"
+                    if row.get("database_name") else ""
+                )
                 return (
                     f"Service: {row['service_name']}\n"
                     f"{desc_line}"
                     f"GitHub repo: {row['github_repo']}\n"
                     f"Tech stack: {row['tech_stack']}\n"
+                    f"{db_line}"
                     f"Service owner: {row['service_owner'] or row['primary_oncall'] or 'N/A'}\n"
                     f"Team Slack group: {row['slack_group_id'] or row['team_slack_group'] or 'N/A'}\n"
                     f"Team on-call: {row['team_oncall'] or 'N/A'}"
@@ -294,41 +484,304 @@ async def list_datasources(args: dict[str, Any]) -> dict[str, Any]:
     return _text_result(text)
 
 
-def _query_loki_logs_sync(query: str, start_offset_minutes: int, limit: int) -> str:
-    """Query Loki directly via HTTP API."""
+# Word → integer mapping used by _resolve_time_expression.
+_WORD_TO_NUM = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "couple": 2, "few": 3, "half": 0.5,
+}
+# Regex fragment that matches either a decimal digit string or a word number.
+_NUM_FRAG = r"(\d+(?:\.\d+)?|" + "|".join(_WORD_TO_NUM.keys()) + r")"
+
+
+def _parse_num(s: str) -> float:
+    try:
+        return float(s)
+    except ValueError:
+        return _WORD_TO_NUM.get(s.lower(), 1)
+
+
+def _resolve_time_expression(expr: str, local_tz) -> tuple:
+    """Resolve a natural-language time expression to (from_dt, to_dt) datetimes.
+
+    Supported patterns (case-insensitive, 'last'/'past' interchangeable):
+      "last/past N min[ute][s]"    → [now − N min, now]
+      "last/past N hour[s]"        → [now − N h,   now]
+      "last/past N day[s]"         → [now − N d,   now]
+      — N may be a digit string OR a word ("two", "couple", "half", "a", "an", …)
+      "yesterday"                  → [start-of-yesterday, end-of-yesterday] (local tz)
+      "today"                      → [start-of-today, now]                  (local tz)
+
+    Returns (None, None) if the expression is not recognised.
+    """
+    import datetime as _dt
+
+    now = _dt.datetime.now(local_tz)
+    e = expr.lower().strip()
+
+    trigger = r"(?:last|past|previous|in\s+the\s+last|in\s+the\s+past)"
+
+    # Optional "of" between the count and the unit: "last couple of hours"
+    _OF = r"(?:\s+of)?"
+
+    # minutes
+    m = _re.search(rf"{trigger}\s+{_NUM_FRAG}{_OF}\s+min(?:ute)?s?", e)
+    if m:
+        return now - _dt.timedelta(minutes=_parse_num(m.group(1))), now
+
+    # hours
+    m = _re.search(rf"{trigger}\s+{_NUM_FRAG}{_OF}\s+hours?", e)
+    if m:
+        return now - _dt.timedelta(hours=_parse_num(m.group(1))), now
+
+    # days
+    m = _re.search(rf"{trigger}\s+{_NUM_FRAG}{_OF}\s+days?", e)
+    if m:
+        return now - _dt.timedelta(days=_parse_num(m.group(1))), now
+
+    # shorthand without trigger: "2h", "30m", "3d"
+    m = _re.search(r"\b(\d+(?:\.\d+)?)\s*h(?:rs?|ours?)?\b", e)
+    if m:
+        return now - _dt.timedelta(hours=float(m.group(1))), now
+
+    m = _re.search(r"\b(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\b", e)
+    if m:
+        return now - _dt.timedelta(minutes=float(m.group(1))), now
+
+    m = _re.search(r"\b(\d+(?:\.\d+)?)\s*d(?:ays?)?\b", e)
+    if m:
+        return now - _dt.timedelta(days=float(m.group(1))), now
+
+    if "yesterday" in e:
+        yesterday = (now - _dt.timedelta(days=1)).date()
+        return (
+            _dt.datetime.combine(yesterday, _dt.time.min, tzinfo=local_tz),
+            _dt.datetime.combine(yesterday, _dt.time.max, tzinfo=local_tz),
+        )
+
+    if "today" in e:
+        return _dt.datetime.combine(now.date(), _dt.time.min, tzinfo=local_tz), now
+
+    return None, None
+
+
+def _build_keyword_filter(keywords: list) -> str:
+    """Return a LogQL |~ filter that matches any keyword (case-insensitive OR)."""
+    escaped = [_re.escape(kw.strip()) for kw in keywords if kw.strip()]
+    if not escaped:
+        return ""
+    return f'|~ "(?i){"|".join(escaped)}"'
+
+
+def _inject_keyword_filter(query: str, kw_filter: str) -> str:
+    """Splice kw_filter into the query before '| json' if present, else append."""
+    if not kw_filter:
+        return query
+    if "| json" in query:
+        return query.replace("| json", f"{kw_filter} | json", 1)
+    return f"{query.rstrip()} {kw_filter}"
+
+
+def _keyword_hits(results: list, keywords: list) -> dict:
+    """Count log lines containing each keyword (case-insensitive) across all streams."""
+    counts: dict = {kw: 0 for kw in keywords}
+    for stream in results:
+        for _, log_line in stream.get("values", []):
+            ll = log_line.lower()
+            for kw in keywords:
+                if kw.lower() in ll:
+                    counts[kw] += 1
+    return counts
+
+
+def _query_loki_logs_sync(
+    query: str,
+    start_offset_minutes: int,
+    limit: int,
+    from_time: Optional[str] = None,
+    to_time: Optional[str] = None,
+    keywords: Optional[list] = None,
+    time_expression: Optional[str] = None,
+) -> str:
+    """Query Loki directly via HTTP API.
+
+    Time range resolution priority (highest → lowest):
+    1. time_expression  — natural language, e.g. "last 2 hours", "yesterday" (computed
+                          server-side from the current local time, so always accurate).
+    2. from_time / to_time — ISO 8601 strings; naive datetimes treated as local timezone.
+    3. start_offset_minutes — relative look-back from now (default fallback).
+
+    Keyword search:
+    When `keywords` is provided the tool:
+    - Builds a combined OR filter and runs one query for all keywords together.
+    - Reports per-keyword hit counts so coverage gaps are immediately visible.
+    - Automatically retries any keyword that got zero hits with its own individual query.
+
+    All timestamps in the response are rendered in the server's local timezone.
+    """
     import time as _time
+    import datetime as _dt
 
     loki_url = (settings.loki_url or "http://localhost:3100").rstrip("/")
-    now_ns = int(_time.time() * 1e9)
-    start_ns = now_ns - int(start_offset_minutes * 60 * 1e9)
+    local_tz = _dt.datetime.now().astimezone().tzinfo
 
-    params = {
-        "query": query,
-        "start": str(start_ns),
-        "end": str(now_ns),
-        "limit": str(min(limit or 100, 500)),
-        "direction": "backward",
-    }
-    try:
+    # ── 1. Resolve time range ────────────────────────────────────────────────
+    start_ns: int
+    end_ns: int
+    range_desc: str
+
+    te_warn: str = ""
+    te_from, te_to = (None, None)
+    if time_expression:
+        te_from, te_to = _resolve_time_expression(time_expression, local_tz)
+        if te_from is None:
+            te_warn = (
+                f"WARNING: time_expression {time_expression!r} was not recognised and was ignored. "
+                f"Fell back to start_offset_minutes={start_offset_minutes}. "
+                f"Supported forms: 'last N hours/minutes/days', 'yesterday', 'today', "
+                f"shorthand '2h'/'30m'/'3d'."
+            )
+
+    if te_from is not None:
+        # time_expression recognised → highest priority
+        start_ns = int(te_from.timestamp() * 1e9)
+        end_ns = int(te_to.timestamp() * 1e9)  # type: ignore[union-attr]
+        range_desc = (
+            f"{te_from.strftime('%Y-%m-%d %H:%M:%S %Z')} → "
+            f"{te_to.strftime('%Y-%m-%d %H:%M:%S %Z')}"  # type: ignore[union-attr]
+        )
+    elif from_time or to_time:
+        def _parse_iso(ts_str: str) -> _dt.datetime:
+            parsed = _dt.datetime.fromisoformat(ts_str)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=local_tz)
+            return parsed
+
+        now_local = _dt.datetime.now(local_tz)
+        end_dt = _parse_iso(to_time) if to_time else now_local
+        start_dt = (
+            _parse_iso(from_time)
+            if from_time
+            else end_dt - _dt.timedelta(minutes=start_offset_minutes)
+        )
+        start_ns = int(start_dt.timestamp() * 1e9)
+        end_ns = int(end_dt.timestamp() * 1e9)
+        range_desc = (
+            f"{start_dt.strftime('%Y-%m-%d %H:%M:%S %Z')} → "
+            f"{end_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+        )
+    else:
+        now_ns = int(_time.time() * 1e9)
+        start_ns = now_ns - int(start_offset_minutes * 60 * 1e9)
+        end_ns = now_ns
+        range_desc = f"last {start_offset_minutes} minute(s)"
+
+    tz_label = _dt.datetime.now(local_tz).strftime("%Z (UTC%z)")
+    # Millisecond timestamps for the Grafana Explore URL range.from / range.to fields.
+    start_ms = start_ns // 1_000_000
+    end_ms = end_ns // 1_000_000
+
+    # ── 2. Build LogQL query (inject keyword OR-filter if provided) ──────────
+    base_query = query
+    kw_filter = _build_keyword_filter(keywords) if keywords else ""
+    combined_query = _inject_keyword_filter(base_query, kw_filter) if kw_filter else base_query
+
+    def _run(q: str) -> list:
+        params = {
+            "query": q,
+            "start": str(start_ns),
+            "end": str(end_ns),
+            "limit": str(min(limit or 100, 500)),
+            "direction": "backward",
+        }
         with httpx.Client(timeout=30.0) as http:
             resp = http.get(f"{loki_url}/loki/api/v1/query_range", params=params)
         if resp.status_code != 200:
-            return f"Error: Loki returned HTTP {resp.status_code}. Response: {resp.text[:500]}"
-        data = resp.json()
-        results = data.get("data", {}).get("result", [])
-        if not results:
-            return f"No log lines found for query: {query} (last {start_offset_minutes} minutes)"
-        total_lines = sum(len(r.get("values", [])) for r in results)
-        lines = [f"Found {total_lines} log line(s) across {len(results)} stream(s) for: {query}\n"]
-        for stream in results:
-            labels = stream.get("stream", {})
-            label_str = ", ".join(f'{k}="{v}"' for k, v in labels.items())
-            lines.append(f"Stream [{label_str}]:")
-            for ts_ns, log_line in stream.get("values", [])[:25]:
-                import datetime
-                ts = datetime.datetime.fromtimestamp(int(ts_ns) / 1e9).strftime("%Y-%m-%d %H:%M:%S")
-                lines.append(f"  [{ts}] {log_line}")
-        return "\n".join(lines)
+            raise RuntimeError(
+                f"Loki returned HTTP {resp.status_code}: {resp.text[:500]}"
+            )
+        return resp.json().get("data", {}).get("result", [])
+
+    try:
+        results = _run(combined_query)
+
+        sections: list[str] = []
+
+        if te_warn:
+            sections.append(te_warn)
+
+        # ── 3. Keyword coverage report ───────────────────────────────────────
+        extra_by_kw: dict = {}
+        if keywords:
+            hit_counts = _keyword_hits(results, keywords)
+            missed = [kw for kw, cnt in hit_counts.items() if cnt == 0]
+
+            # Individual retry for each missed keyword
+            for kw in missed:
+                solo_q = _inject_keyword_filter(base_query, _build_keyword_filter([kw]))
+                try:
+                    solo_results = _run(solo_q)
+                    if solo_results:
+                        extra_by_kw[kw] = solo_results
+                        hit_counts[kw] = sum(
+                            len(r.get("values", [])) for r in solo_results
+                        )
+                except Exception:
+                    pass
+
+            cov_lines = [f"Keyword coverage ({len(keywords)} keyword(s) searched):"]
+            for kw, cnt in hit_counts.items():
+                icon = "✓" if cnt > 0 else "✗"
+                note = f"{cnt} hit(s)" if cnt > 0 else "NOT FOUND in combined query"
+                cov_lines.append(f"  [{icon}] {kw!r} — {note}")
+            sections.append("\n".join(cov_lines))
+
+        # ── 4. Combined results ──────────────────────────────────────────────
+        def _format_stream_lines(stream_list: list, cap: int = 25) -> list[str]:
+            out = []
+            for stream in stream_list:
+                labels = stream.get("stream", {})
+                label_str = ", ".join(f'{k}="{v}"' for k, v in labels.items())
+                out.append(f"Stream [{label_str}]:")
+                for ts_ns, log_line in stream.get("values", [])[:cap]:
+                    ts = _dt.datetime.fromtimestamp(
+                        int(ts_ns) / 1e9, tz=local_tz
+                    ).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    out.append(f"  [{ts}] {log_line}")
+            return out
+
+        if results:
+            total = sum(len(r.get("values", [])) for r in results)
+            header = (
+                f"Found {total} log line(s) across {len(results)} stream(s).\n"
+                f"Query: {combined_query}\n"
+                f"Time range: {range_desc} | Timestamps in: {tz_label}\n"
+                f"Grafana range → start_ms={start_ms}  end_ms={end_ms}"
+            )
+            sections.append(header)
+            sections.append("\n".join(_format_stream_lines(results)))
+        else:
+            sections.append(
+                f"No log lines matched the combined query.\n"
+                f"Query: {combined_query}\n"
+                f"Range: {range_desc}\n"
+                f"Grafana range → start_ms={start_ms}  end_ms={end_ms}"
+            )
+
+        # ── 5. Individual results for keywords that missed the combined run ──
+        for kw, kw_results in extra_by_kw.items():
+            kw_total = sum(len(r.get("values", [])) for r in kw_results)
+            solo_q = _inject_keyword_filter(base_query, _build_keyword_filter([kw]))
+            kw_header = (
+                f"Individual results for keyword {kw!r} "
+                f"({kw_total} line(s) — retried separately):\n"
+                f"Query: {solo_q}"
+            )
+            sections.append(kw_header)
+            sections.append("\n".join(_format_stream_lines(kw_results, cap=10)))
+
+        return "\n\n".join(sections)
+
     except Exception as e:
         return f"Error reaching Loki at {loki_url}: {e}"
 
@@ -337,11 +790,38 @@ def _query_loki_logs_sync(query: str, start_offset_minutes: int, limit: int) -> 
     "query_loki_logs",
     (
         "Query Grafana Loki logs using a LogQL expression. "
-        "Use label selectors like {app=\"payment-service-sample\"} or {job=\"vconnect\"} with filters like |= \"error\". "
-        "start_offset_minutes controls how far back to look (default 60, use 360 for 6 hours). "
-        "Returns matching log lines with timestamps."
+        "Use label selectors like {app=\"payment-service-sample\"} or {job=\"vconnect\"} "
+        "with filters like |= \"error\".\n\n"
+
+        "TIME RANGE — three options (highest priority first):\n"
+        "  1. time_expression: natural language string resolved server-side from the current "
+        "local time. Supported: 'last N minutes', 'last N hours', 'last N days', "
+        "'yesterday', 'today'. ALWAYS use this when the reporter says something like "
+        "'last 2 hours', 'yesterday afternoon', etc.\n"
+        "  2. from_time / to_time: ISO 8601 strings (e.g. '2026-02-22T14:00:00'). "
+        "Naive datetimes are treated as the server's local timezone.\n"
+        "  3. start_offset_minutes: relative look-back from now (default 60; "
+        "use 360 for 6 hours, 1440 for 24 hours).\n\n"
+
+        "KEYWORD SEARCH — pass keywords as a list of individual terms "
+        "(e.g. ['international', 'payment', 'error']). The tool will:\n"
+        "  • Run one combined OR query across all keywords.\n"
+        "  • Report per-keyword hit counts so you can see coverage gaps.\n"
+        "  • Automatically retry any keyword that had zero hits with its own query.\n"
+        "ALWAYS decompose a multi-word description into individual keywords. "
+        "For 'international payment errors' pass keywords=['international','payment','error'].\n\n"
+
+        "Returned timestamps are displayed in the server's local timezone."
     ),
-    {"query": str, "start_offset_minutes": int, "limit": int},
+    {
+        "query": str,
+        "start_offset_minutes": int,
+        "limit": int,
+        "from_time": Optional[str],
+        "to_time": Optional[str],
+        "keywords": Optional[list],
+        "time_expression": Optional[str],
+    },
 )
 async def query_loki_logs(args: dict[str, Any]) -> dict[str, Any]:
     text = await asyncio.to_thread(
@@ -349,6 +829,10 @@ async def query_loki_logs(args: dict[str, Any]) -> dict[str, Any]:
         args["query"],
         args.get("start_offset_minutes", 60),
         args.get("limit", 100),
+        args.get("from_time"),
+        args.get("to_time"),
+        args.get("keywords"),
+        args.get("time_expression"),
     )
     return _text_result(text)
 
@@ -417,11 +901,17 @@ async def postgres_describe_table(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "postgres_run_query",
-    "Run a read-only SQL query against the configured PostgreSQL database and return the result.",
-    {"query": str},
+    (
+        "Run a read-only SQL query against the configured PostgreSQL database and return the result. "
+        "Optionally pass database_name (obtained from lookup_service_owner) to target the specific "
+        "service database instead of the default POSTGRES_READONLY_URL database."
+    ),
+    {"query": str, "database_name": Optional[str]},
 )
 async def postgres_run_query(args: dict[str, Any]) -> dict[str, Any]:
-    text = await asyncio.to_thread(_postgres_run_query_sync, args["query"])
+    text = await asyncio.to_thread(
+        _postgres_run_query_sync, args["query"], args.get("database_name")
+    )
     return _text_result(text)
 
 
@@ -445,6 +935,68 @@ async def postgres_summarize_table(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def postgres_inspect_query(args: dict[str, Any]) -> dict[str, Any]:
     text = await asyncio.to_thread(_postgres_inspect_query_sync, args["query"])
+    return _text_result(text)
+
+
+@tool(
+    "mysql_show_tables",
+    (
+        "List all tables in a MySQL database. Uses the configured read-only MySQL connection. "
+        "Optionally pass database_name (obtained from lookup_service_owner) to target the specific "
+        "service database instead of the default MYSQL_READONLY_URL database."
+    ),
+    {"database_name": Optional[str]},
+)
+async def mysql_show_tables(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(_mysql_show_tables_sync, args.get("database_name"))
+    return _text_result(text)
+
+
+@tool(
+    "mysql_describe_table",
+    (
+        "Return the schema (column name, data type, is_nullable) for a table in MySQL. "
+        "Optionally pass database_name (obtained from lookup_service_owner) to target the specific "
+        "service database instead of the default MYSQL_READONLY_URL database."
+    ),
+    {"table": str, "database_name": Optional[str]},
+)
+async def mysql_describe_table(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(
+        _mysql_describe_table_sync, args["table"], args.get("database_name")
+    )
+    return _text_result(text)
+
+
+@tool(
+    "mysql_run_query",
+    (
+        "Run a read-only SQL query against the configured MySQL database and return the result. "
+        "Optionally pass database_name (obtained from lookup_service_owner) to target the specific "
+        "service database instead of the default MYSQL_READONLY_URL database."
+    ),
+    {"query": str, "database_name": Optional[str]},
+)
+async def mysql_run_query(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(
+        _mysql_run_query_sync, args["query"], args.get("database_name")
+    )
+    return _text_result(text)
+
+
+@tool(
+    "mysql_summarize_table",
+    (
+        "Compute key summary statistics (counts, min/max, distinct values) for columns in a MySQL table. "
+        "Optionally pass database_name (obtained from lookup_service_owner) to target the specific "
+        "service database instead of the default MYSQL_READONLY_URL database."
+    ),
+    {"table": str, "database_name": Optional[str]},
+)
+async def mysql_summarize_table(args: dict[str, Any]) -> dict[str, Any]:
+    text = await asyncio.to_thread(
+        _mysql_summarize_table_sync, args["table"], args.get("database_name")
+    )
     return _text_result(text)
 
 
@@ -607,5 +1159,9 @@ def build_custom_tools_server():
             postgres_run_query,
             postgres_summarize_table,
             postgres_inspect_query,
+            mysql_show_tables,
+            mysql_describe_table,
+            mysql_run_query,
+            mysql_summarize_table,
         ],
     )

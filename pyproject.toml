@@ -19,6 +19,7 @@ dependencies = [
     "claude-agent-sdk>=0.1.36",
     "anthropic>=0.40.0",
     "psycopg[binary]>=3.0.0",
+    "pymysql>=1.1.0",
     "sentence-transformers>=3.0.0",
     "pgvector>=0.3.0",
 ]

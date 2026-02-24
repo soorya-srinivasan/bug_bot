@@ -164,7 +164,9 @@ class ServiceTeamMapping(Base):
     team_slack_group: Mapped[str | None] = mapped_column(String(30))
     primary_oncall: Mapped[str | None] = mapped_column(String(20))
     tech_stack: Mapped[str] = mapped_column(String(20), nullable=False)
-    service_owner: Mapped[str | None] = mapped_column(String(20))
+    service_owner: Mapped[str | None] = mapped_column(String(20))  # permanent tech owner Slack ID
+    database_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    dialect: Mapped[str | None] = mapped_column(String(20), nullable=True)  # "postgres" | "mysql"
     team_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("teams.id", ondelete="SET NULL"), nullable=True
     )
